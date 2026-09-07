@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"弹窗窗口默认权限：事件监听 + 窗口基础操作","local":true,"windows":["popup"],"permissions":["core:default","core:event:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-focus","core:window:allow-center"]}}

@@ -1,0 +1,16 @@
+[build]
+# 构建产物放纯 ASCII 路径：GNU ld 无法打开中文路径下的 .o 文件
+target-dir = "C:/Users/Chu_Xin_r/AppData/Local/launcher/target"
+# build.rs 在 host 目标编译，也需要 GNU Windows 的兼容配置和 Shell 导入库。
+rustflags = [
+    "--cfg", "getrandom_backend=\"windows_legacy\"",
+    "-l", "shell32",
+]
+
+[target.x86_64-pc-windows-gnu]
+# windows-targets 的 GNU 非 raw-dylib 分支使用聚合库名；补入真实 Shell 导入库。
+rustflags = [
+    "--cfg", "getrandom_backend=\"windows_legacy\"",
+    "-l", "shell32",
+]
+

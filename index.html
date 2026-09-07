@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>launcher</title>
+  </head>
+  <body>
+    <div id="panel" class="panel">
+      <div class="search-wrap">
+        <svg class="search-glyph" viewBox="0 0 24 24" width="20" height="20">
+          <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/>
+          <line x1="15.5" y1="15.5" x2="20.5" y2="20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <input id="q" placeholder="搜索文件、文件夹…" autocomplete="off" spellcheck="false" />
+        <span id="status" class="status"></span>
+      </div>
+      <div id="results" class="results"></div>
+      <div class="footer">
+        <span class="key">↑↓</span>选择
+        <span class="key">↵</span>打开
+        <span class="key">Ctrl ↵</span>所在文件夹
+        <span class="key">Esc</span>关闭
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

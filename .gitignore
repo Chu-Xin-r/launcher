@@ -1,0 +1,10 @@
+# 构建产物
+node_modules/
+dist/
+target/
+*.log
+*.tsbuildinfo
+
+# 本地杂项
+rust_out.exe
+msvc-cargo.cmd
