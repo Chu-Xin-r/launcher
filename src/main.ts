@@ -26,6 +26,8 @@ let items: ResultDto[] = [];
 let sel = 0;
 let searchSeq = 0;
 let staggerTimer: number | undefined;
+// 当前呼出快捷键展示文案（空态提示用）
+let hotkeyLabel = "双击 Ctrl";
 
 // —— 图标缓存：exe/lnk 按真实路径取应用自身图标，其余按扩展名 ——
 const iconCache = new Map<string, string>();
@@ -89,7 +91,7 @@ function render(stagger: boolean) {
     return;
   }
   if (items.length === 0) {
-    results.innerHTML = `<div class="empty"><div style="font-size:34px">⌘</div><div>双击 Ctrl 已为你呼出</div><div class="hint">输入即搜，全盘文件毫秒级呈现</div></div>`;
+    results.innerHTML = `<div class="empty"><div style="font-size:34px">⌘</div><div>${esc(hotkeyLabel)} 已为你呼出</div><div class="hint">输入即搜，全盘文件毫秒级呈现</div></div>`;
     return;
   }
   results.classList.toggle("stagger", stagger);
@@ -128,6 +130,17 @@ function ensureVisible() {
   }
 }
 
+/** 仅更新选中态（不重建列表）：高亮平滑滑到目标行 */
+function selectRow(next: number) {
+  if (next === sel || next < 0 || next >= items.length) return;
+  const prevEl = results.querySelector<HTMLElement>(`.row[data-i="${sel}"]`);
+  const nextEl = results.querySelector<HTMLElement>(`.row[data-i="${next}"]`);
+  prevEl?.classList.remove("sel");
+  nextEl?.classList.add("sel");
+  sel = next;
+  nextEl?.scrollIntoView({ block: "nearest" });
+}
+
 async function doSearch() {
   const query = q.value;
   const seq = ++searchSeq;
@@ -145,6 +158,20 @@ async function doSearch() {
   const ms = performance.now() - t0;
   if (res.length > 0) {
     statusEl.textContent = `${res.length} 项 · ${ms.toFixed(0)}ms`;
+  }
+}
+
+/** 刷新呼出快捷键展示文案（空态提示用） */
+async function refreshHotkeyLabel() {
+  try {
+    const label = await invoke<string>("get_hotkey_label");
+    if (label && label !== hotkeyLabel) {
+      hotkeyLabel = label;
+      // 空态正在显示时立即重绘提示文案
+      if (items.length === 0 && q.value.trim() === "" && !settingsMode) render(false);
+    }
+  } catch {
+    /* 忽略：保留旧文案 */
   }
 }
 
@@ -169,17 +196,11 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown") {
     if (settingsMode) return;
     e.preventDefault();
-    if (sel < items.length - 1) {
-      sel++;
-      render(false);
-    }
+    selectRow(sel + 1);
   } else if (e.key === "ArrowUp") {
     if (settingsMode) return;
     e.preventDefault();
-    if (sel > 0) {
-      sel--;
-      render(false);
-    }
+    selectRow(sel - 1);
   } else if (e.key === "Enter") {
     if (settingsMode) return;
     e.preventDefault();
@@ -350,6 +371,7 @@ async function renderSettings() {
     try {
       await invoke("set_settings", { settings: dto });
       themeSetting = dto.theme;
+      refreshHotkeyLabel();
       status.textContent = "已保存";
       listenHotkeyError();
       window.setTimeout(() => (status.textContent = ""), 2500);
@@ -388,6 +410,7 @@ await listen("popup-shown", () => {
   q.value = "";
   items = [];
   sel = 0;
+  refreshHotkeyLabel();
   render(true);
   refreshStatus();
   applyTheme();
@@ -395,6 +418,10 @@ await listen("popup-shown", () => {
   window.setTimeout(() => q.focus(), 30);
   window.setTimeout(() => q.focus(), 150);
   window.setTimeout(() => q.focus(), 400);
+});
+// 退场：播放收起动画（后端约 160ms 后真正隐藏窗口）
+await listen("popup-hiding", () => {
+  panel.classList.remove("visible");
 });
 // 窗口获得焦点时若处于搜索态，确保光标在搜索框
 window.addEventListener("focus", () => {
@@ -431,3 +458,4 @@ async function refreshStatus() {
   }
 }
 refreshStatus();
+refreshHotkeyLabel();

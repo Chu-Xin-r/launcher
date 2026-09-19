@@ -376,7 +376,7 @@ fn show_popup_inner(app: &AppHandle) {
     hide_tao_flash_windows();
 
     // 兜底：呼出后立刻切走窗口时可能从未获得焦点（无失焦事件），
-    // 1 秒后复查——仍可见且无焦点则自动收起
+    // 200ms 后复查——仍可见且无焦点则自动收起
     let a = app.clone();
     let gen = POPUP_GENERATION.load(Ordering::Acquire);
     std::thread::spawn(move || {
@@ -385,22 +385,34 @@ fn show_popup_inner(app: &AppHandle) {
             use tauri::Manager;
             if let Some(w) = a.get_webview_window("popup") {
                 if POPUP_VISIBLE.load(Ordering::Acquire) && !w.is_focused().unwrap_or(true) {
-                    POPUP_GENERATION.fetch_add(1, Ordering::AcqRel);
-                    apply_visible(&w, false);
+                    hide_popup(&a);
                 }
             }
         }
     });
 }
 
-/// 隐藏弹窗（内部实现）。
+/// 隐藏弹窗（内部实现）：通知前端播放退场动画（~160ms）后真正隐藏窗口；
+/// 退场期间若被重新呼出（世代变化）则放弃隐藏。
 pub fn hide_popup(app: &AppHandle) {
     use tauri::Manager;
     POPUP_GENERATION.fetch_add(1, Ordering::AcqRel);
-    if let Some(w) = app.get_webview_window("popup") {
-        apply_visible(&w, false);
-        let _ = w.hide(); // 真隐藏：焦点自然离开；show 路径有防御性 show 可恢复
-    }
+    let gen = POPUP_GENERATION.load(Ordering::Acquire);
+    let Some(w) = app.get_webview_window("popup") else {
+        return;
+    };
+    POPUP_VISIBLE.store(false, Ordering::Release);
+    let _ = w.set_ignore_cursor_events(true); // 退场期间不再响应鼠标
+    let _ = app.emit("popup-hiding", ());
+    let w2 = w.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        if POPUP_GENERATION.load(Ordering::Acquire) == gen
+            && !POPUP_VISIBLE.load(Ordering::Acquire)
+        {
+            let _ = w2.hide();
+        }
+    });
 }
 
 /// 呼出/隐藏弹窗（主线程调用）。

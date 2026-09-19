@@ -56,15 +56,20 @@ body {
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
   overflow: hidden;
-  transform: scale(0.92) translateY(10px);
+  /* 退场目标态（移除 .visible 时按此态过渡：快速收缩淡出） */
+  transform: scale(0.96) translateY(7px);
   opacity: 0;
   transition:
-    transform 0.28s cubic-bezier(0.2, 1.3, 0.35, 1),
-    opacity 0.16s ease-out;
+    transform 0.15s cubic-bezier(0.55, 0, 0.85, 0.5),
+    opacity 0.13s ease-in;
 }
 .panel.visible {
+  /* 入场：衰减弹簧（轻微过冲后回稳），每次呼出重播 */
   transform: scale(1) translateY(0);
   opacity: 1;
+  transition:
+    transform 0.42s linear(0, 0.19, 0.55, 0.86, 1.06, 1.12, 1.09, 1.03, 1.0, 0.995, 1),
+    opacity 0.22s ease-out;
 }
 
 /* 搜索框 */
@@ -125,6 +130,7 @@ body {
   padding: 9px 12px;
   border-radius: 12px;
   cursor: default;
+  transition: background-color 0.13s ease-out;
 }
 .row.sel {
   background: var(--row-active);
@@ -175,13 +181,14 @@ body {
 
 /* 逐行浮现（仅在弹窗呼出后的首轮渲染启用） */
 .results.stagger .row {
-  animation: rowIn 0.2s cubic-bezier(0.2, 0.9, 0.3, 1) both;
-  animation-delay: calc(var(--i) * 16ms);
+  animation: rowIn 0.26s cubic-bezier(0.22, 1, 0.36, 1) both;
+  /* 交错延迟封顶：前 ~12 行逐行浮现，之后同时出场，长列表不拖尾 */
+  animation-delay: min(calc(var(--i) * 14ms + 40ms), 210ms);
 }
 @keyframes rowIn {
   from {
     opacity: 0;
-    transform: translateY(9px) scale(0.98);
+    transform: translateY(10px) scale(0.985);
   }
   to {
     opacity: 1;
@@ -199,6 +206,18 @@ body {
   color: var(--text-faint);
   font-size: 14px;
   gap: 8px;
+  animation: emptyIn 0.3s ease-out both;
+  animation-delay: 70ms;
+}
+@keyframes emptyIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 .empty .hint {
   font-size: 12px;

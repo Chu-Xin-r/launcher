@@ -49,9 +49,6 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // 托盘
-            setup_tray(&handle)?;
-
             // 引擎：先注册状态（搜索立即可用、返回空），后台线程建索引
             let engine = Engine::new();
             let cfg = settings::load_settings();
@@ -67,7 +64,12 @@ fn main() {
                 icon_cache: Mutex::new(std::collections::HashMap::new()),
                 usage: Mutex::new(commands::load_usage()),
                 excluded: Mutex::new(commands::normalize_excluded(&cfg.excluded_dirs)),
+                tray_show_item: Mutex::new(None),
+                tray_icon: Mutex::new(None),
             });
+
+            // 托盘（在状态注册后初始化，便于保存句柄供设置变更时刷新文案）
+            setup_tray(&handle)?;
 
             let h2 = handle.clone();
             std::thread::spawn(move || {
@@ -125,13 +127,22 @@ fn main() {
             commands::set_settings,
             commands::open_settings,
             commands::get_windows_theme,
+            commands::get_hotkey_label,
         ])
         .run(tauri::generate_context!())
         .expect("launcher 运行失败");
 }
 
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示启动器 (双击 Ctrl)", true, None::<&str>)?;
+    let cfg = settings::load_settings();
+    let label = commands::hotkey_label(&cfg.hotkey_mode, &cfg.custom_hotkey);
+    let show = MenuItem::with_id(
+        app,
+        "show",
+        format!("显示启动器（{label}）"),
+        true,
+        None::<&str>,
+    )?;
     let conf = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &conf, &quit])?;
@@ -140,8 +151,8 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
-    tray
-        .tooltip("启动器 · 双击 Ctrl 呼出")
+    let tray = tray
+        .tooltip(format!("启动器 · {label} 呼出"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, ev| match ev.id().as_ref() {
@@ -173,5 +184,11 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
+    // 保存句柄：设置变更时刷新菜单文案与 tooltip
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.tray_show_item.lock().unwrap() = Some(show);
+        *state.tray_icon.lock().unwrap() = Some(tray);
+    }
     Ok(())
 }

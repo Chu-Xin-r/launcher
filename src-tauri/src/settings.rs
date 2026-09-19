@@ -79,31 +79,6 @@ fn to_pcw(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 读注册表字符串值（进程内直读，不产生子进程/控制台窗口）
-pub fn reg_get_string(subkey: &str, value: &str) -> Option<String> {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
-    let sk = to_pcw(subkey);
-    let vn = to_pcw(value);
-    let mut buf = [0u16; 1024];
-    let mut size = (buf.len() * 2) as u32;
-    unsafe {
-        let r = RegGetValueW(
-            HKEY_CURRENT_USER,
-            windows::core::PCWSTR(sk.as_ptr()),
-            windows::core::PCWSTR(vn.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr() as *mut _),
-            Some(&mut size),
-        );
-        if r.is_err() {
-            return None;
-        }
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-    Some(String::from_utf16_lossy(&buf[..len]))
-}
-
 /// 读注册表 DWORD 值
 pub fn reg_get_dword(subkey: &str, value: &str) -> Option<u32> {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -126,39 +101,6 @@ pub fn reg_get_dword(subkey: &str, value: &str) -> Option<u32> {
         }
     }
     Some(out)
-}
-
-fn reg_set_string(subkey: &str, value: &str, data: &str) -> Result<(), String> {
-    use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
-    };
-    let sk = to_pcw(subkey);
-    let vn = to_pcw(value);
-    let mut data_u16 = to_pcw(data);
-    let mut hk = windows::Win32::System::Registry::HKEY::default();
-    unsafe {
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            windows::core::PCWSTR(sk.as_ptr()),
-            0,
-            KEY_SET_VALUE,
-            &mut hk,
-        )
-        .is_err()
-        {
-            return Err("打开注册表失败".into());
-        }
-        let bytes: &[u8] = std::slice::from_raw_parts(
-            data_u16.as_ptr() as *const u8,
-            data_u16.len() * 2,
-        );
-        if RegSetValueExW(hk, windows::core::PCWSTR(vn.as_ptr()), 0, REG_SZ, Some(bytes))
-            .is_err()
-        {
-            return Err("写入注册表失败".into());
-        }
-    }
-    Ok(())
 }
 
 fn reg_delete_value(subkey: &str, value: &str) -> Result<(), String> {

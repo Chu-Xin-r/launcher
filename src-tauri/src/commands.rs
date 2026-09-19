@@ -22,6 +22,10 @@ pub struct AppState {
     pub usage: Mutex<HashMap<String, u32>>,
     /// 归一化后的排除目录前缀（搜索结果兜底过滤）
     pub excluded: Mutex<Vec<String>>,
+    /// 托盘“显示启动器”菜单项（设置变更时刷新文案）
+    pub tray_show_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
+    /// 托盘图标（设置变更时刷新 tooltip）
+    pub tray_icon: Mutex<Option<tauri::tray::TrayIcon<tauri::Wry>>>,
 }
 
 pub struct CachedIcon {
@@ -232,6 +236,41 @@ pub fn normalize_excluded(dirs: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 呼出快捷键的展示文本（托盘 / 前端空态共用）。
+pub fn hotkey_label(mode: &str, custom: &str) -> String {
+    match mode {
+        "alt_space" => "Alt + 空格".to_string(),
+        "custom" => {
+            let parts: Vec<String> = custom
+                .split('+')
+                .map(|p| match p.trim().to_ascii_lowercase().as_str() {
+                    "ctrl" | "control" => "Ctrl".to_string(),
+                    "alt" => "Alt".to_string(),
+                    "shift" => "Shift".to_string(),
+                    "win" | "meta" => "Win".to_string(),
+                    "space" => "空格".to_string(),
+                    "" => String::new(),
+                    other => other.to_uppercase(),
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                "双击 Ctrl".to_string()
+            } else {
+                parts.join(" + ")
+            }
+        }
+        _ => "双击 Ctrl".to_string(),
+    }
+}
+
+/// 当前呼出快捷键的展示文本（前端空态提示读取）。
+#[tauri::command]
+pub fn get_hotkey_label() -> String {
+    let s = crate::settings::load_settings();
+    hotkey_label(&s.hotkey_mode, &s.custom_hotkey)
+}
+
 #[derive(Serialize)]
 pub struct VolumeDto {
     pub letter: char,
@@ -321,6 +360,15 @@ pub fn set_settings(
         excluded_dirs: s.excluded_dirs.clone(),
     })?;
     *state.excluded.lock().unwrap() = normalized;
+
+    // 刷新托盘文案（呼出快捷键可能已变化）
+    let label = hotkey_label(&s.hotkey_mode, &s.custom_hotkey);
+    if let Some(item) = state.tray_show_item.lock().unwrap().as_ref() {
+        let _ = item.set_text(format!("显示启动器（{label}）"));
+    }
+    if let Some(tray) = state.tray_icon.lock().unwrap().as_ref() {
+        let _ = tray.set_tooltip(Some(format!("启动器 · {label} 呼出")));
+    }
 
     // 磁盘/排除目录变更 → 后台重建索引
     if config_changed {
