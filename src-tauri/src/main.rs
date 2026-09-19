@@ -86,6 +86,9 @@ fn main() {
                 hotkey::init_hidden(&w);
             }
 
+            // 开机自启自愈：任务计划指向当前 exe（防止指向旧路径/调试版）
+            settings::heal_autostart_if_enabled();
+
             Ok(())
         })
         .on_window_event(|window, event| {

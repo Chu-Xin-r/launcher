@@ -187,22 +187,73 @@ fn reg_delete_value(subkey: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 查询当前是否已配置开机自启。
-pub fn autostart_enabled() -> bool {
-    reg_get_string(RUN_SUBKEY, RUN_VALUE).is_some_and(|s| !s.is_empty())
+const TASK_NAME: &str = "com.chuxinr.launcher";
+
+/// 运行控制台命令且不弹出控制台窗口（CREATE_NO_WINDOW）。
+fn run_hidden(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new(cmd)
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|e| e.to_string())
 }
 
-/// 设置/取消开机自启（写入当前 exe 路径）。
+/// 当前 exe 是否处于开发构建目录（target/）。
+fn is_dev_build() -> bool {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_ascii_lowercase().contains("\target\\"))
+        .unwrap_or(false)
+}
+
+/// 查询当前是否已配置开机自启（计划任务存在即视为启用）。
+pub fn autostart_enabled() -> bool {
+    run_hidden("schtasks", &["/query", "/tn", TASK_NAME])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 设置/取消开机自启。
+/// 使用计划任务（onlogon + 最高权限）而非 Run 键：
+/// 管理员清单的 exe 从 Run 键启动会每次弹 UAC，计划任务可静默提权。
 pub fn set_autostart(enable: bool) -> Result<(), String> {
     if enable {
+        if is_dev_build() {
+            return Err("开发构建不支持开机自启，请安装正式版后再设置".into());
+        }
         let exe = std::env::current_exe()
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .to_string();
-        reg_set_string(RUN_SUBKEY, RUN_VALUE, &exe)
+        let tr = format!("\"{exe}\"");
+        let o = run_hidden(
+            "schtasks",
+            &[
+                "/create", "/f", "/tn", TASK_NAME, "/tr", &tr, "/sc", "onlogon", "/rl",
+                "highest",
+            ],
+        )?;
+        if !o.status.success() {
+            return Err(format!(
+                "创建计划任务失败: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        // 清理历史遗留的 Run 键
+        let _ = reg_delete_value(RUN_SUBKEY, RUN_VALUE);
+        Ok(())
     } else {
-        reg_delete_value(RUN_SUBKEY, RUN_VALUE)
-            .map_err(|e| format!("{e}（可能本就未启用）"))
+        let _ = run_hidden("schtasks", &["/delete", "/tn", TASK_NAME, "/f"]);
+        let _ = reg_delete_value(RUN_SUBKEY, RUN_VALUE);
+        Ok(())
+    }
+}
+
+/// 安装版启动自愈：settings 里开启了自启时，确保计划任务指向当前 exe。
+pub fn heal_autostart_if_enabled() {
+    let s = load_settings();
+    if s.autostart && !is_dev_build() {
+        let _ = set_autostart(true);
     }
 }
 
