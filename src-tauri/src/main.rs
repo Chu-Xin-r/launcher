@@ -8,6 +8,7 @@
 mod commands;
 mod hotkey;
 mod settings;
+mod shell_ops;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -128,6 +129,11 @@ fn main() {
             commands::open_settings,
             commands::get_windows_theme,
             commands::get_hotkey_label,
+            shell_ops::open_in_terminal,
+            shell_ops::run_as_admin,
+            shell_ops::copy_file,
+            shell_ops::show_properties,
+            shell_ops::open_with_dialog,
         ])
         .run(tauri::generate_context!())
         .expect("launcher 运行失败");

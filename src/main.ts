@@ -183,8 +183,138 @@ q.addEventListener("input", () => {
   debounce = window.setTimeout(doSearch, 30);
 });
 
+// —— 右键动作菜单 ——
+let ctxEl: HTMLDivElement | null = null;
+// 关闭菜单的那次点击不触发“打开”
+let ctxGuard = false;
+
+function closeCtxMenu() {
+  if (ctxEl) {
+    ctxEl.remove();
+    ctxEl = null;
+  }
+}
+
+interface CtxEntry {
+  label: string;
+  hint?: string;
+  run: () => void;
+}
+
+function buildCtxEntries(it: ResultDto): (CtxEntry | "sep")[] {
+  const ext = extOf(it.name);
+  const isApp =
+    !it.is_dir &&
+    (ext === ".exe" || ext === ".lnk" || ext === ".bat" || ext === ".cmd" || ext === ".msi");
+  const hide = () => invoke("hide_window");
+  const entries: (CtxEntry | "sep")[] = [
+    { label: "打开", hint: "↵", run: () => { hide(); invoke("open_path", { path: it.path }); } },
+    { label: "打开所在文件夹", hint: "Ctrl ↵", run: () => { hide(); invoke("reveal_path", { path: it.path }); } },
+    "sep",
+    { label: "复制路径", run: () => copyFlash(it.path, false) },
+    { label: "复制文件", run: () => copyFlash(it.path, true) },
+    "sep",
+    { label: "在 cmd 中打开", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "cmd" }); } },
+    { label: "在 PowerShell 中打开", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "powershell" }); } },
+    { label: "在 cmd 中打开（管理员）", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "cmd_admin" }); } },
+    { label: "在 PowerShell 中打开（管理员）", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "powershell_admin" }); } },
+  ];
+  const extra: CtxEntry[] = [];
+  if (isApp) {
+    extra.push({ label: "以管理员身份运行", run: () => { hide(); invoke("run_as_admin", { path: it.path }); } });
+  }
+  if (!it.is_dir) {
+    extra.push({ label: "打开方式…", run: () => { hide(); invoke("open_with_dialog", { path: it.path }); } });
+  }
+  if (extra.length > 0) entries.push("sep", ...extra);
+  entries.push("sep", { label: "属性", run: () => { hide(); invoke("show_properties", { path: it.path }); } });
+  return entries;
+}
+
+async function copyFlash(path: string, asFile: boolean) {
+  try {
+    await invoke(asFile ? "copy_file" : "copy_path", { path });
+    flashStatus(asFile ? "已复制文件，可在资源管理器粘贴" : "已复制路径");
+  } catch {
+    flashStatus("复制失败");
+  }
+}
+
+let flashTimer = 0;
+function flashStatus(text: string) {
+  statusEl.textContent = text;
+  window.clearTimeout(flashTimer);
+  flashTimer = window.setTimeout(() => refreshStatus(), 1800);
+}
+
+function showCtxMenu(x: number, y: number, it: ResultDto, idx: number) {
+  closeCtxMenu();
+  selectRow(idx);
+  const el = document.createElement("div");
+  el.className = "ctx";
+  for (const ent of buildCtxEntries(it)) {
+    if (ent === "sep") {
+      const sep = document.createElement("div");
+      sep.className = "ctx-sep";
+      el.appendChild(sep);
+      continue;
+    }
+    const rowEl = document.createElement("div");
+    rowEl.className = "ctx-item";
+    rowEl.innerHTML = `<span>${esc(ent.label)}</span>${ent.hint ? `<span class="ctx-hint">${esc(ent.hint)}</span>` : ""}`;
+    rowEl.addEventListener("click", () => {
+      closeCtxMenu();
+      ent.run();
+    });
+    el.appendChild(rowEl);
+  }
+  document.body.appendChild(el);
+  // 边界钳制（距窗口边缘 8px）
+  const r = el.getBoundingClientRect();
+  const px = Math.max(8, Math.min(x, window.innerWidth - r.width - 8));
+  const py = Math.max(8, Math.min(y, window.innerHeight - r.height - 8));
+  el.style.left = `${px}px`;
+  el.style.top = `${py}px`;
+  ctxEl = el;
+}
+
+// 全应用禁止系统右键菜单；结果行上弹出动作菜单
+document.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const target = e.target as HTMLElement;
+  if (target.closest(".ctx")) return;
+  const row = target.closest<HTMLElement>(".row");
+  if (!row || settingsMode) {
+    closeCtxMenu();
+    return;
+  }
+  const idx = Number(row.dataset.i);
+  const it = items[idx];
+  if (!it) return;
+  showCtxMenu(e.clientX, e.clientY, it, idx);
+});
+
+// 点击菜单以外区域：关闭菜单，且不误触“打开”
+window.addEventListener("mousedown", (e) => {
+  if (ctxEl && !(e.target as HTMLElement).closest(".ctx")) {
+    closeCtxMenu();
+    ctxGuard = true;
+  } else if (!ctxEl) {
+    ctxGuard = false;
+  }
+});
+
 // —— 键盘导航 ——
 window.addEventListener("keydown", (e) => {
+  if (ctxEl) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeCtxMenu();
+      return;
+    }
+    // 其他按键：先关菜单，再按原逻辑处理
+    closeCtxMenu();
+  }
   if (e.key === "Escape") {
     if (settingsMode) {
       exitSettings();
@@ -215,8 +345,12 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// 点击 = 打开
+// 点击 = 打开（刚关掉右键菜单的那次点击不触发）
 results.addEventListener("click", (e) => {
+  if (ctxGuard) {
+    ctxGuard = false;
+    return;
+  }
   const row = (e.target as HTMLElement).closest<HTMLElement>(".row");
   if (!row) return;
   const it = items[Number(row.dataset.i)];
@@ -405,6 +539,7 @@ listen("settings-view", () => {
 
 // —— 弹窗显隐动画 ——
 await listen("popup-shown", () => {
+  closeCtxMenu();
   panel.classList.add("visible");
   settingsMode = false;
   q.value = "";
@@ -421,6 +556,7 @@ await listen("popup-shown", () => {
 });
 // 退场：播放收起动画（后端约 160ms 后真正隐藏窗口）
 await listen("popup-hiding", () => {
+  closeCtxMenu();
   panel.classList.remove("visible");
 });
 // 窗口获得焦点时若处于搜索态，确保光标在搜索框
