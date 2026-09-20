@@ -17,8 +17,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE,
-    CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+    CreateProcessW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+    CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{
@@ -116,15 +116,44 @@ fn find_explorer_pid() -> Option<u32> {
     }
 }
 
-/// 直接启动（继承当前进程权限；控制台程序自动获得新终端窗口）。
+/// 直接启动（继承当前进程权限；显式新建控制台窗口）。
+///
+/// 关键：不继承调用方句柄（bInheritHandles=FALSE）。若走 Rust Command 的
+/// 句柄继承，启动器从脚本/管道环境启动时会把被重定向的 std 句柄传给子进程，
+/// cmd.exe 会因 stdin 立即读到 EOF 而秒退（无窗口）。此写法与降权启动同构。
 fn spawn_direct(exe: &str, dir: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe);
-    if dir.is_dir() {
-        cmd.current_dir(dir);
+    unsafe {
+        let mut cmdline: Vec<u16> = format!("\"{exe}\"")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let dir_w = to_pcw(&dir.to_string_lossy());
+        let dir_ptr = if dir.is_dir() {
+            PCWSTR(dir_w.as_ptr())
+        } else {
+            PCWSTR::null()
+        };
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let r = CreateProcessW(
+            PCWSTR::null(),
+            PWSTR(cmdline.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+            None,
+            dir_ptr,
+            &si,
+            &mut pi,
+        );
+        if r.is_ok() {
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+        }
+        r.map_err(|e| format!("启动失败: {e}"))
     }
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("启动失败: {e}"))
 }
 
 /// 降权启动：借 explorer 的用户令牌拉起中完整性进程。
