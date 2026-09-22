@@ -62,9 +62,9 @@ fn main() {
             hotkey::set_custom_hotkey(custom_active, &hotkey_str);
             app.manage(AppState {
                 engine: Arc::clone(&engine),
-                icon_cache: Mutex::new(std::collections::HashMap::new()),
-                usage: Mutex::new(commands::load_usage()),
-                excluded: Mutex::new(commands::normalize_excluded(&cfg.excluded_dirs)),
+                icon_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                usage: Arc::new(Mutex::new(commands::load_usage())),
+                excluded: Arc::new(Mutex::new(commands::normalize_excluded(&cfg.excluded_dirs))),
                 tray_show_item: Mutex::new(None),
                 tray_icon: Mutex::new(None),
             });

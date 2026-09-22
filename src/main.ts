@@ -31,39 +31,69 @@ let hotkeyLabel = "双击 Ctrl";
 
 // —— 图标缓存：exe/lnk 按真实路径取应用自身图标，其余按扩展名 ——
 const iconCache = new Map<string, string>();
+// 同一图标的并发请求合并（快速输入时同一扩展名/路径会被多行同时请求）
+const iconInflight = new Map<string, Promise<string>>();
 
 function isApp(r: ResultDto): boolean {
   const ext = extOf(r.name);
   return !r.is_dir && (ext === ".exe" || ext === ".lnk");
 }
 
-async function iconUrl(r: ResultDto): Promise<string> {
+function iconUrl(r: ResultDto): Promise<string> {
   const ext = r.is_dir ? "dir" : extOf(r.name);
   const cacheKey = isApp(r) ? "p:" + r.path.toLowerCase() : ext;
   const hit = iconCache.get(cacheKey);
-  if (hit !== undefined) return hit;
-  try {
-    const dto = await invoke<IconDto>("get_icon", {
-      key: ext,
-      path: isApp(r) ? r.path : "",
-    });
-    const cv = document.createElement("canvas");
-    cv.width = dto.w;
-    cv.height = dto.h;
-    const ctx = cv.getContext("2d")!;
-    ctx.putImageData(
-      new ImageData(new Uint8ClampedArray(dto.rgba), dto.w, dto.h),
-      0,
-      0
-    );
-    const url = cv.toDataURL();
-    iconCache.set(cacheKey, url);
-    return url;
-  } catch {
-    iconCache.set(cacheKey, "");
-    return "";
-  }
+  if (hit !== undefined) return Promise.resolve(hit);
+  const busy = iconInflight.get(cacheKey);
+  if (busy) return busy;
+  const p = (async () => {
+    try {
+      const dto = await invoke<IconDto>("get_icon", {
+        key: ext,
+        path: isApp(r) ? r.path : "",
+      });
+      const cv = document.createElement("canvas");
+      cv.width = dto.w;
+      cv.height = dto.h;
+      const ctx = cv.getContext("2d")!;
+      ctx.putImageData(
+        new ImageData(new Uint8ClampedArray(dto.rgba), dto.w, dto.h),
+        0,
+        0
+      );
+      const url = cv.toDataURL();
+      iconCache.set(cacheKey, url);
+      return url;
+    } catch {
+      iconCache.set(cacheKey, "");
+      return "";
+    } finally {
+      iconInflight.delete(cacheKey);
+    }
+  })();
+  iconInflight.set(cacheKey, p);
+  return p;
 }
+
+// 图标懒加载：只给进入视口（提前 120px）的行取图标。
+// 结果有 50 行但可见约 8 行，避免每次渲染为整页做图标提取/解码。
+const iconObserver = new IntersectionObserver(
+  (entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const el = e.target as HTMLImageElement;
+      iconObserver.unobserve(el);
+      const row = el.closest(".row");
+      if (!row) continue;
+      const it = items[Number(row.getAttribute("data-i"))];
+      if (!it) continue;
+      iconUrl(it).then((url) => {
+        if (url) el.src = url;
+      });
+    }
+  },
+  { root: results, rootMargin: "120px 0px" }
+);
 
 function extOf(name: string): string {
   const i = name.lastIndexOf(".");
@@ -108,13 +138,10 @@ function render(stagger: boolean) {
       </div>`;
     })
     .join("");
-  // 异步填图标
+  // 异步填图标（懒加载：仅视口内的行）
+  iconObserver.disconnect();
   for (const img of Array.from(results.querySelectorAll("img"))) {
-    const el = img as HTMLImageElement;
-    const i = Number(el.closest(".row")!.getAttribute("data-i"));
-    iconUrl(items[i]).then((url) => {
-      if (url) el.src = url;
-    });
+    iconObserver.observe(img);
   }
   if (stagger) {
     window.clearTimeout(staggerTimer);

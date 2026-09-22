@@ -160,6 +160,17 @@ fn rebuild_volume_aligned(letter: char) -> Option<(VolumeIndex, HANDLE, u64, i64
     Some((vi, h, jid, next))
 }
 
+/// 节流保存快照：锁内只做序列化（内存拷贝），校验和 + 写盘在锁外完成，
+/// 避免 269MB 的哈希与磁盘 IO 长时间占住索引读锁、把并发搜索一起拖住。
+fn save_snapshot_offlock(engine: &Engine) {
+    let path = engine.snapshot_path.lock().unwrap().clone();
+    let body = {
+        let idx = engine.index.read().unwrap();
+        snapshot::encode(&idx)
+    };
+    let _ = snapshot::write(body, &path);
+}
+
 /// USN 阻塞读循环：变更即时应用；脏且超 60 秒时保存快照；
 /// 日志回绕时原地 MFT 重建并继续监听。`gen` 不匹配时退出（索引被重建）。
 fn usn_loop(engine: Arc<Engine>, letter: char, handle: SendHandle, mut journal_id: u64, mut cursor: i64, gen: u64) {
@@ -194,16 +205,14 @@ fn usn_loop(engine: Arc<Engine>, letter: char, handle: SendHandle, mut journal_i
                 }
                 cursor = next;
                 if dirty && last_save.elapsed() > Duration::from_secs(60) {
-                    let path = engine.snapshot_path.lock().unwrap().clone();
-                    let _ = snapshot::save_snapshot(&engine.index.read().unwrap(), &path);
+                    save_snapshot_offlock(&engine);
                     last_save = Instant::now();
                     dirty = false;
                 }
             }
             Err(UsnError::Timeout) => {
                 if dirty && last_save.elapsed() > Duration::from_secs(60) {
-                    let path = engine.snapshot_path.lock().unwrap().clone();
-                    let _ = snapshot::save_snapshot(&engine.index.read().unwrap(), &path);
+                    save_snapshot_offlock(&engine);
                     last_save = Instant::now();
                     dirty = false;
                 }

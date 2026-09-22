@@ -20,10 +20,20 @@ fn fnv1a(data: &[u8], seed: u64) -> u64 {
     h
 }
 
-/// 保存到 `path`（先写 .tmp 再原子替换）。
-pub fn save_snapshot(index: &Index, path: &Path) -> Result<(), String> {
-    let t0 = std::time::Instant::now();
-    let mut body: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
+/// 序列化索引为快照字节流（不含尾部校验和）。
+///
+/// 调用方持有索引读锁期间执行：只做内存拷贝，不做哈希与磁盘 IO。
+pub fn encode(index: &Index) -> Vec<u8> {
+    // 预估容量，避免序列化过程中的多次扩容拷贝
+    let cap = 16
+        + index
+            .volumes
+            .iter()
+            .map(|v| {
+                32 + v.names.len() * 2 + v.pys.len() * 2 + v.entries.len() * 24 + v.frns.len() * 8
+            })
+            .sum::<usize>();
+    let mut body: Vec<u8> = Vec::with_capacity(cap);
     put_u32(&mut body, MAGIC);
     put_u16(&mut body, VERSION);
     put_u16(&mut body, index.volumes.len() as u16);
@@ -52,23 +62,37 @@ pub fn save_snapshot(index: &Index, path: &Path) -> Result<(), String> {
             std::slice::from_raw_parts(v.frns.as_ptr() as *const u8, v.frns.len() * 8)
         });
     }
+    body
+}
+
+/// 追加校验和并原子写盘。**不持有索引锁**：校验和（269MB 全量哈希）与磁盘
+/// 写入是秒级操作，放在锁内会把并发搜索排到写锁后面一起卡住。
+pub fn write(mut body: Vec<u8>, path: &Path) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     let sum = fnv1a(&body, 0);
-    let mut file = body;
-    put_u64(&mut file, sum);
+    put_u64(&mut body, sum);
 
     let tmp = path.with_extension("tmp");
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("建目录失败: {e}"))?;
     }
-    fs::write(&tmp, &file).map_err(|e| format!("写快照失败: {e}"))?;
+    fs::write(&tmp, &body).map_err(|e| format!("写快照失败: {e}"))?;
     fs::rename(&tmp, path).map_err(|e| format!("替换快照失败: {e}"))?;
     eprintln!(
         "快照已保存: {} ({:.1} MB, {:.2}s)",
         path.display(),
-        file.len() as f64 / 1048576.0,
+        body.len() as f64 / 1048576.0,
         t0.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// 保存到 `path`（先写 .tmp 再原子替换）。
+///
+/// 注意：调用方持有索引读锁时，整个哈希+写盘过程都在锁内。启动/重建/退出
+/// 等非热路径可直接用；周期保存（USN 线程）请改用 `encode` + `write` 分离。
+pub fn save_snapshot(index: &Index, path: &Path) -> Result<(), String> {
+    write(encode(index), path)
 }
 
 /// 载入快照。校验失败/版本不符返回 Err（调用方降级为重建）。

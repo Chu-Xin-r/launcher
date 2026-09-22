@@ -17,11 +17,12 @@ use searchcore::matcher::SearchOptions;
 
 pub struct AppState {
     pub engine: Arc<Engine>,
-    pub icon_cache: Mutex<HashMap<String, Option<CachedIcon>>>,
+    /// 图标缓存（按扩展名 / 真实路径）。Arc 包装：图标提取在阻塞线程池执行
+    pub icon_cache: Arc<Mutex<HashMap<String, Option<CachedIcon>>>>,
     /// 路径 → 打开次数（使用频次排名）
-    pub usage: Mutex<HashMap<String, u32>>,
+    pub usage: Arc<Mutex<HashMap<String, u32>>>,
     /// 归一化后的排除目录前缀（搜索结果兜底过滤）
-    pub excluded: Mutex<Vec<String>>,
+    pub excluded: Arc<Mutex<Vec<String>>>,
     /// 托盘“显示启动器”菜单项（设置变更时刷新文案）
     pub tray_show_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
     /// 托盘图标（设置变更时刷新 tooltip）
@@ -85,8 +86,7 @@ pub fn record_use(state: &AppState, path: &str) {
 }
 
 /// 频次加权重排：常用项最多 +1500 分（≈ 一个词首命中的量级，不会压过精确匹配）。
-fn apply_usage_boost(state: &AppState, items: &mut Vec<ResultDto>) {
-    let usage = state.usage.lock().unwrap();
+fn apply_usage_boost(usage: &HashMap<String, u32>, items: &mut Vec<ResultDto>) {
     if usage.is_empty() {
         return;
     }
@@ -95,38 +95,45 @@ fn apply_usage_boost(state: &AppState, items: &mut Vec<ResultDto>) {
             r.score += (c as i32 * 250).min(1_500);
         }
     }
-    drop(usage);
     items.sort_unstable_by(|a, b| b.score.cmp(&a.score));
 }
 
+/// 搜索。异步命令 + 阻塞线程池：350 万条扫描不能占用 UI 主线程，
+/// 否则每次按键都会卡住窗口消息循环（表现为打字发滞）。
 #[tauri::command]
-pub fn search(query: String, state: State<'_, AppState>) -> Vec<ResultDto> {
+pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<ResultDto>, String> {
     if query.trim().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mut items: Vec<ResultDto> = state
-        .engine
-        .search(&query, &SearchOptions { limit: 50, ..Default::default() })
-        .items
-        .into_iter()
-        .map(|r| ResultDto {
-            name: r.name,
-            path: r.path,
-            is_dir: r.is_dir,
-            score: r.score,
-            match_start: r.match_start,
-            match_len: r.match_len,
-        })
-        .collect();
-    // 排除目录兜底过滤（索引增量阶段新文件也会被挡住）
-    {
-        let excluded = state.excluded.lock().unwrap();
-        if !excluded.is_empty() {
-            items.retain(|r| !crate::settings::is_excluded(&r.path, &excluded));
+    let engine = Arc::clone(&state.engine);
+    let usage = Arc::clone(&state.usage);
+    let excluded = Arc::clone(&state.excluded);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut items: Vec<ResultDto> = engine
+            .search(&query, &SearchOptions { limit: 50, ..Default::default() })
+            .items
+            .into_iter()
+            .map(|r| ResultDto {
+                name: r.name,
+                path: r.path,
+                is_dir: r.is_dir,
+                score: r.score,
+                match_start: r.match_start,
+                match_len: r.match_len,
+            })
+            .collect();
+        // 排除目录兜底过滤（索引增量阶段新文件也会被挡住）
+        {
+            let ex = excluded.lock().unwrap();
+            if !ex.is_empty() {
+                items.retain(|r| !crate::settings::is_excluded(&r.path, &ex));
+            }
         }
-    }
-    apply_usage_boost(&state, &mut items);
-    items
+        apply_usage_boost(&usage.lock().unwrap(), &mut items);
+        items
+    })
+    .await
+    .map_err(|e| format!("搜索失败: {e}"))
 }
 
 #[tauri::command]
@@ -406,30 +413,40 @@ pub fn get_windows_theme() -> String {
 
 /// 按扩展名取文件图标（RGBA）。`key`：扩展名（含点，如 ".pdf"）或 "dir"。
 /// `path` 非空且为 .exe/.lnk 时提取该文件的真实应用图标，缓存按完整路径。
+/// 异步 + 阻塞线程池：SHGetFileInfo 冷启动实测可达 180ms，绝不能占着 UI 主线程。
 #[tauri::command]
-pub fn get_icon(key: String, path: String, state: State<'_, AppState>) -> Result<IconDto, String> {
-    let lower = path.to_ascii_lowercase();
-    let is_app = lower.ends_with(".exe") || lower.ends_with(".lnk");
-    let mut cache = state.icon_cache.lock().unwrap();
-    if cache.len() > 2048 {
-        cache.clear(); // 真实路径缓存防膨胀
-    }
-    let cache_key = if is_app { format!("p:{lower}") } else { key.clone() };
-    let cached = cache.entry(cache_key).or_insert_with(|| {
-        if is_app {
-            extract_icon_from_path(&path).or_else(|| extract_icon(&key))
-        } else {
-            extract_icon(&key)
+pub async fn get_icon(
+    key: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<IconDto, String> {
+    let cache = Arc::clone(&state.icon_cache);
+    tauri::async_runtime::spawn_blocking(move || {
+        let lower = path.to_ascii_lowercase();
+        let is_app = lower.ends_with(".exe") || lower.ends_with(".lnk");
+        let mut cache = cache.lock().unwrap();
+        if cache.len() > 2048 {
+            cache.clear(); // 真实路径缓存防膨胀
         }
-    });
-    match cached {
-        Some(c) => Ok(IconDto {
-            w: c.w,
-            h: c.h,
-            rgba: c.rgba.clone(),
-        }),
-        None => Err("无图标".into()),
-    }
+        let cache_key = if is_app { format!("p:{lower}") } else { key.clone() };
+        let cached = cache.entry(cache_key).or_insert_with(|| {
+            if is_app {
+                extract_icon_from_path(&path).or_else(|| extract_icon(&key))
+            } else {
+                extract_icon(&key)
+            }
+        });
+        match cached {
+            Some(c) => Ok(IconDto {
+                w: c.w,
+                h: c.h,
+                rgba: c.rgba.clone(),
+            }),
+            None => Err("无图标".into()),
+        }
+    })
+    .await
+    .map_err(|e| format!("图标任务失败: {e}"))?
 }
 
 /// 初始化本线程 COM（Shell 图标提取依赖），已初始化则忽略。
