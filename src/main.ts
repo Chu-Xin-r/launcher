@@ -125,19 +125,23 @@ function render(stagger: boolean) {
     return;
   }
   results.classList.toggle("stagger", stagger);
-  results.innerHTML = items
-    .map((r, i) => {
-      const badge = r.is_dir ? "文件夹" : extOf(r.name).slice(1).toUpperCase();
-      return `<div class="row${i === sel ? " sel" : ""}" data-i="${i}" style="--i:${i}">
+  const isRecent = q.value.trim() === "";
+  results.innerHTML =
+    (isRecent ? `<div class="recent-title">最近使用</div>` : "") +
+    items
+      .map((r, i) => {
+        const badge = r.is_dir ? "文件夹" : extOf(r.name).slice(1).toUpperCase();
+        const nameHtml = r.match_len > 0 ? highlight(r.name, r.match_start, r.match_len) : esc(r.name);
+        return `<div class="row${i === sel ? " sel" : ""}" data-i="${i}" style="--i:${i}">
         <img data-ext="${esc(extOf(r.name))}" data-dir="${r.is_dir ? 1 : 0}" alt=""/>
         <div class="txt">
-          <div class="name">${highlight(r.name, r.match_start, r.match_len)}</div>
+          <div class="name">${nameHtml}</div>
           <div class="path">${esc(r.path)}</div>
         </div>
         <span class="badge">${esc(badge)}</span>
       </div>`;
-    })
-    .join("");
+      })
+      .join("");
   // 异步填图标（懒加载：仅视口内的行）
   iconObserver.disconnect();
   for (const img of Array.from(results.querySelectorAll("img"))) {
@@ -168,9 +172,24 @@ function selectRow(next: number) {
   nextEl?.scrollIntoView({ block: "nearest" });
 }
 
-async function doSearch() {
+async function doSearch(stagger = false) {
   const query = q.value;
   const seq = ++searchSeq;
+  // 空查询：展示“最近使用”（呼出即直达常用文件）
+  if (query.trim() === "") {
+    let rec: ResultDto[] = [];
+    try {
+      rec = await invoke<ResultDto[]>("recent_items", { limit: 8 });
+    } catch {
+      rec = [];
+    }
+    if (seq !== searchSeq || settingsMode || q.value.trim() !== "") return;
+    items = rec;
+    sel = 0;
+    render(stagger);
+    refreshStatus();
+    return;
+  }
   const t0 = performance.now();
   let res: ResultDto[] = [];
   try {
@@ -554,7 +573,7 @@ function listenHotkeyError() {
 
 function exitSettings() {
   settingsMode = false;
-  render(true);
+  void doSearch(true);
 }
 
 // 设置入口在托盘右键菜单（设置 → 弹出启动器并切换到设置视图）
@@ -573,7 +592,7 @@ await listen("popup-shown", () => {
   items = [];
   sel = 0;
   refreshHotkeyLabel();
-  render(true);
+  void doSearch(true); // 空查询 → 载入“最近使用”（带交错动画）
   refreshStatus();
   applyTheme();
   // 多次补聚焦，对抗窗口激活与 WebView 焦点恢复的竞态

@@ -118,6 +118,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::search,
+            commands::recent_items,
             commands::open_path,
             commands::reveal_path,
             commands::copy_path,

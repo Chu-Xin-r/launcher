@@ -19,8 +19,8 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// 图标缓存（按扩展名 / 真实路径）。Arc 包装：图标提取在阻塞线程池执行
     pub icon_cache: Arc<Mutex<HashMap<String, Option<CachedIcon>>>>,
-    /// 路径 → 打开次数（使用频次排名）
-    pub usage: Arc<Mutex<HashMap<String, u32>>>,
+    /// 路径 → 使用统计（次数 + 最近打开时间；频次加权与"最近使用"共用）
+    pub usage: Arc<Mutex<HashMap<String, UseStat>>>,
     /// 归一化后的排除目录前缀（搜索结果兜底过滤）
     pub excluded: Arc<Mutex<Vec<String>>>,
     /// 托盘“显示启动器”菜单项（设置变更时刷新文案）
@@ -52,6 +52,37 @@ pub struct IconDto {
     pub rgba: Vec<u8>,
 }
 
+/// 使用统计：打开次数 + 最近一次打开时间（epoch 毫秒）。
+/// 兼容旧版 usage.json（值是纯数字 = 次数），加载时补 t = 0。
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct UseStat {
+    pub c: u32,
+    pub t: u64,
+}
+
+impl<'de> Deserialize<'de> for UseStat {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Old(u32),
+            New {
+                #[serde(default)]
+                c: u32,
+                #[serde(default)]
+                t: u64,
+            },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Old(n) => UseStat { c: n, t: 0 },
+            Repr::New { c, t } => UseStat { c, t },
+        })
+    }
+}
+
 fn to_pcw(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -64,35 +95,44 @@ pub fn usage_file() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("usage.json"))
 }
 
-pub fn load_usage() -> HashMap<String, u32> {
+pub fn load_usage() -> HashMap<String, UseStat> {
     std::fs::read_to_string(usage_file())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_usage(usage: &HashMap<String, u32>) {
+fn save_usage(usage: &HashMap<String, UseStat>) {
     if let Ok(s) = serde_json::to_string(usage) {
         let _ = std::fs::write(usage_file(), s);
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn record_use(state: &AppState, path: &str) {
     {
         let mut usage = state.usage.lock().unwrap();
-        *usage.entry(path.to_string()).or_insert(0) += 1;
+        let st = usage.entry(path.to_string()).or_insert(UseStat { c: 0, t: 0 });
+        st.c += 1;
+        st.t = now_ms();
         save_usage(&usage);
     }
 }
 
 /// 频次加权重排：常用项最多 +1500 分（≈ 一个词首命中的量级，不会压过精确匹配）。
-fn apply_usage_boost(usage: &HashMap<String, u32>, items: &mut Vec<ResultDto>) {
+fn apply_usage_boost(usage: &HashMap<String, UseStat>, items: &mut Vec<ResultDto>) {
     if usage.is_empty() {
         return;
     }
     for r in items.iter_mut() {
-        if let Some(&c) = usage.get(&r.path) {
-            r.score += (c as i32 * 250).min(1_500);
+        if let Some(st) = usage.get(&r.path) {
+            r.score += (st.c as i32 * 250).min(1_500);
         }
     }
     items.sort_unstable_by(|a, b| b.score.cmp(&a.score));
@@ -134,6 +174,46 @@ pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Res
     })
     .await
     .map_err(|e| format!("搜索失败: {e}"))
+}
+
+/// 最近使用（空白态展示）：按最近打开时间倒序（旧数据按次数兜底），
+/// 过滤已不存在的路径；结构与搜索结果一致，前端复用同一套行渲染。
+#[tauri::command]
+pub async fn recent_items(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<ResultDto>, String> {
+    let usage = Arc::clone(&state.usage);
+    tauri::async_runtime::spawn_blocking(move || {
+        let u = usage.lock().unwrap();
+        let mut list: Vec<(&String, &UseStat)> = u.iter().collect();
+        list.sort_by(|a, b| b.1.t.cmp(&a.1.t).then_with(|| b.1.c.cmp(&a.1.c)));
+        let mut out: Vec<ResultDto> = Vec::with_capacity(limit.min(64));
+        for (path, _) in list {
+            if out.len() >= limit {
+                break;
+            }
+            let p = std::path::Path::new(path.as_str());
+            if !p.exists() {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            out.push(ResultDto {
+                name,
+                path: path.clone(),
+                is_dir: p.is_dir(),
+                score: 0,
+                match_start: 0,
+                match_len: 0,
+            });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("最近使用读取失败: {e}"))?
 }
 
 #[tauri::command]

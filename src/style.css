@@ -227,6 +227,15 @@ body {
   font-size: 12px;
 }
 
+/* 空白态：最近使用 */
+.recent-title {
+  padding: 4px 12px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint);
+  letter-spacing: 0.05em;
+}
+
 /* 底部快捷键提示 */
 .footer {
   display: flex;
