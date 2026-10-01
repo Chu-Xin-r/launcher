@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
 
 use crate::index::{Index, VolumeIndex};
-use crate::matcher::{self, SearchOptions, SearchOutcome};
+use crate::matcher::{self, SearchOptions, SearchOutcome, SearchResult};
 use crate::mft;
 use crate::snapshot;
 use crate::usn::{self, UsnError};
@@ -41,6 +41,17 @@ pub struct Engine {
     pub stats: RwLock<EngineStats>,
     /// USN 线程累计应用的变更数（诊断用）
     pub applied_updates: AtomicU64,
+    /// UWP / 系统应用列表（外壳枚举后注入；不在文件索引内）
+    uwp: RwLock<Vec<UwpApp>>,
+}
+
+/// UWP / 系统应用条目（无磁盘文件的商店应用）。
+pub struct UwpApp {
+    pub name: String,
+    /// 全拼池（小写连写；无汉字则为空）
+    pub py: Vec<u16>,
+    /// 可执行路径：`shell:AppsFolder\{AUMID}`
+    pub path: String,
 }
 
 /// HANDLE 的 Send 包装（Windows 句柄本身可跨线程使用）
@@ -261,6 +272,7 @@ impl Engine {
                 usn_live: Vec::new(),
             }),
             applied_updates: AtomicU64::new(0),
+            uwp: RwLock::new(Vec::new()),
         })
     }
 
@@ -494,11 +506,72 @@ impl Engine {
     }
 
     /// 搜索（供 UI 每次按键调用；自动作废上一次未完成的扫描）。
+    /// 注入/刷新 UWP 与系统应用列表（启动时后台枚举后调用）。
+    pub fn set_uwp_apps(&self, apps: Vec<(String, String)>) {
+        let list: Vec<UwpApp> = apps
+            .into_iter()
+            .filter(|(n, a)| !n.trim().is_empty() && !a.is_empty())
+            .map(|(name, aumid)| {
+                let name_u16: Vec<u16> = name.encode_utf16().collect();
+                let py = crate::py::pinyin_of(&name_u16).unwrap_or_default();
+                UwpApp {
+                    name,
+                    py,
+                    path: format!("shell:AppsFolder\\{aumid}"),
+                }
+            })
+            .collect();
+        *self.uwp.write().unwrap() = list;
+    }
+
+    /// 按 AUMID 查显示名（“最近使用”恢复 UWP 应用名称用）。
+    pub fn uwp_app_name(&self, aumid: &str) -> Option<String> {
+        let path = format!("shell:AppsFolder\\{aumid}");
+        self.uwp
+            .read()
+            .unwrap()
+            .iter()
+            .find(|a| a.path == path)
+            .map(|a| a.name.clone())
+    }
+
     pub fn search(&self, query: &str, opts: &SearchOptions) -> SearchOutcome {
         // query_gen 兼任取消代数：本查询 ID 为自增后的新值，之后任何新搜索都会使 load > gen
         let gen = self.query_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        let idx = self.index.read().unwrap();
-        matcher::search(&idx, query, Some((&self.query_gen, gen)), opts)
+        let mut out = {
+            let idx = self.index.read().unwrap();
+            matcher::search(&idx, query, Some((&self.query_gen, gen)), opts)
+        };
+        // UWP / 系统应用：小型列表直接并入（与文件结果同场排序）
+        if !out.cancelled {
+            let uwp = self.uwp.read().unwrap();
+            if !uwp.is_empty() {
+                let mut added = false;
+                for a in uwp.iter() {
+                    if let Some((mut score, spans)) = matcher::match_external(&a.name, &a.py, query) {
+                        score += 1_500; // 与开始菜单快捷方式同档提权
+                        let (ms, ml) = spans.first().map(|&(s, e)| (s, e - s)).unwrap_or((0, 0));
+                        out.items.push(SearchResult {
+                            volume: usize::MAX,
+                            slot: 0,
+                            score,
+                            name: a.name.clone(),
+                            path: a.path.clone(),
+                            is_dir: false,
+                            match_start: ms,
+                            match_len: ml,
+                            spans,
+                        });
+                        added = true;
+                    }
+                }
+                if added {
+                    out.items.sort_unstable_by(|a, b| b.score.cmp(&a.score));
+                    out.items.truncate(opts.limit);
+                }
+            }
+        }
+        out
     }
 
     /// 按配置重建索引：停 USN 线程 → 重建（跳过禁用盘，剔除排除目录）→ 重启 USN → 存快照。

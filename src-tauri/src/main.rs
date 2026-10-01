@@ -5,7 +5,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod commands;
+mod custom_cmd;
 mod hotkey;
 mod settings;
 mod shell_ops;
@@ -63,6 +65,7 @@ fn main() {
             app.manage(AppState {
                 engine: Arc::clone(&engine),
                 icon_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                uwp_icons: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 usage: Arc::new(Mutex::new(commands::load_usage())),
                 excluded: Arc::new(Mutex::new(commands::normalize_excluded(&cfg.excluded_dirs))),
                 tray_show_item: Mutex::new(None),
@@ -79,6 +82,38 @@ fn main() {
                     "index-ready",
                     serde_json::to_value(IndexReadyPayload::from(&stats)).unwrap_or_default(),
                 );
+            });
+
+            // UWP / 系统应用枚举（后台；注入搜索引擎并预填图标缓存）
+            let h3 = handle.clone();
+            std::thread::spawn(move || {
+                let apps = shell_ops::enumerate_uwp_apps();
+                if apps.is_empty() {
+                    return;
+                }
+                if let Some(state) = h3.try_state::<AppState>() {
+                    {
+                        let mut icons = state.uwp_icons.lock().unwrap();
+                        for a in &apps {
+                            if let Some((w, h, rgba)) = &a.icon {
+                                icons.insert(
+                                    commands::app_icon_cache_key(&format!(
+                                        "shell:AppsFolder\\{}",
+                                        a.aumid
+                                    )),
+                                    commands::CachedIcon {
+                                        w: *w,
+                                        h: *h,
+                                        rgba: rgba.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    state
+                        .engine
+                        .set_uwp_apps(apps.into_iter().map(|a| (a.name, a.aumid)).collect());
+                }
             });
 
             // 双击 Ctrl 热键
@@ -130,6 +165,10 @@ fn main() {
             commands::open_settings,
             commands::get_windows_theme,
             commands::get_hotkey_label,
+            commands::list_custom_commands,
+            commands::save_custom_commands,
+            commands::run_custom,
+            commands::commands_file_path,
             shell_ops::open_in_terminal,
             shell_ops::run_as_admin,
             shell_ops::copy_file,

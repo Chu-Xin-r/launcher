@@ -53,9 +53,11 @@ pub struct SearchResult {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
-    /// 命中起点/长度（u16 单位，用于 UI 高亮）
+    /// 命中起点/长度（u16 单位，用于 UI 高亮；取第一个词的区间）
     pub match_start: u16,
     pub match_len: u16,
+    /// 全部命中词的区间（多词高亮；拼音命中无区间）
+    pub spans: Vec<(u16, u16)>,
 }
 
 pub struct SearchOutcome {
@@ -324,6 +326,46 @@ fn match_terms(name: &[u16], py: &[u16], terms: &[&[u16]]) -> Option<(i32, u16, 
     Some(hit)
 }
 
+/// 收集各词在名字上的命中区间（多词高亮用；仅对最终结果调用，成本可忽略）。
+fn collect_spans(name: &[u16], py: &[u16], terms: &[&[u16]]) -> Vec<(u16, u16)> {
+    let mut spans = Vec::with_capacity(terms.len());
+    for t in terms {
+        if let Some((_, s, e)) = match_one(name, py, t) {
+            if e > s {
+                spans.push((s, e));
+            }
+        }
+    }
+    spans
+}
+
+/// 拆分查询为关键词（半角/全角空格、制表符分隔，封顶 6 个）。
+fn split_terms(q: &[u16]) -> Vec<&[u16]> {
+    q.split(|&c| c == b' ' as u16 || c == 0x3000 || c == b'\t' as u16)
+        .filter(|t| !t.is_empty())
+        .take(6)
+        .collect()
+}
+
+/// 匹配外部小型列表项（UWP / 系统应用）：与索引内条目共用同一套匹配规则。
+/// 返回 (score, 全部命中区间)。
+pub fn match_external(name: &str, py: &[u16], query: &str) -> Option<(i32, Vec<(u16, u16)>)> {
+    let q: Vec<u16> = query
+        .encode_utf16()
+        .map(|c| if c < 128 { fold(c) } else { c })
+        .collect();
+    if q.is_empty() {
+        return None;
+    }
+    let terms = split_terms(&q);
+    if terms.is_empty() {
+        return None;
+    }
+    let name_u16: Vec<u16> = name.encode_utf16().collect();
+    let (score, _, _) = match_terms(&name_u16, py, &terms)?;
+    Some((score, collect_spans(&name_u16, py, &terms)))
+}
+
 fn scan_chunk(
     entries: &[crate::types::Entry],
     base_slot: u32,
@@ -476,21 +518,27 @@ pub fn search(
     merged.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
     merged.truncate(opts.limit);
 
-    // 3) 组装结果（只为最终 limit 条构建路径）
+    // 3) 组装结果（只为最终 limit 条构建路径与命中区间）
     let items = merged
         .into_iter()
         .map(|(vi, (score, slot, start, end))| {
             let v = &index.volumes[vi];
             let e = &v.entries[slot as usize];
             let full = v.name_slice(e);
-            let name: String = if e.flags & FLAG_IS_PATH != 0 {
+            let name_u16: &[u16] = if e.flags & FLAG_IS_PATH != 0 {
                 match full.iter().rposition(|&c| c == b'\\' as u16) {
-                    Some(p) => String::from_utf16_lossy(&full[p + 1..]),
-                    None => String::from_utf16_lossy(full),
+                    Some(p) => &full[p + 1..],
+                    None => full,
                 }
             } else {
-                String::from_utf16_lossy(full)
+                full
             };
+            let py: &[u16] = if e.has_py() {
+                &v.pys[e.py_off as usize..e.py_off as usize + e.py_len as usize]
+            } else {
+                &[]
+            };
+            let spans = collect_spans(name_u16, py, &terms);
             let path = if e.flags & FLAG_IS_PATH != 0 {
                 String::from_utf16_lossy(full)
             } else {
@@ -500,11 +548,12 @@ pub fn search(
                 volume: vi,
                 slot,
                 score,
-                name,
+                name: String::from_utf16_lossy(name_u16),
                 path,
                 is_dir: e.is_dir(),
                 match_start: start,
                 match_len: end - start,
+                spans,
             }
         })
         .collect();
@@ -561,5 +610,15 @@ mod tests {
         let t = w("vs");
         let hit = match_one(&name, &[], &t).unwrap();
         assert!(hit.0 >= 7_900, "vs 应按缩写命中 Visual Studio: {}", hit.0);
+    }
+
+    #[test]
+    fn external_match_uwp_rules() {
+        // UWP 应用名走同一套规则：有拼音池 → 全拼命中；无拼音池 → 不命中
+        let py = w("shezhi");
+        assert!(match_external("设置", &py, "shezhi").is_some(), "带拼音池应命中全拼");
+        assert!(match_external("设置", &[], "shezhi").is_none(), "无拼音池不应命中全拼");
+        let (_, spans) = match_external("Visual Studio Code", &[], "vs code").unwrap();
+        assert_eq!(spans.len(), 2, "两个词应各有高亮区间");
     }
 }

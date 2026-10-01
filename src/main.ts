@@ -9,7 +9,33 @@ interface ResultDto {
   score: number;
   match_start: number;
   match_len: number;
+  spans: [number, number][];
+  /** file | command | audio */
+  kind?: string;
+  subtitle?: string;
 }
+
+/** 自定义命令（与后端 CustomCommand 对应） */
+interface CustomCommand {
+  id: string;
+  name: string;
+  keyword: string;
+  kind: string;
+  command: string;
+  args: string[];
+  workdir: string;
+  admin: boolean;
+  hidden: boolean;
+  enabled: boolean;
+}
+
+const CMD_KINDS: [string, string][] = [
+  ["shell", "cmd 命令"],
+  ["powershell", "PowerShell"],
+  ["exe", "运行程序"],
+  ["url", "打开网址"],
+  ["builtin", "内置动作"],
+];
 
 interface IconDto {
   w: number;
@@ -34,9 +60,30 @@ const iconCache = new Map<string, string>();
 // 同一图标的并发请求合并（快速输入时同一扩展名/路径会被多行同时请求）
 const iconInflight = new Map<string, Promise<string>>();
 
+function isUwp(r: ResultDto): boolean {
+  return !r.is_dir && r.path.startsWith("shell:AppsFolder\\");
+}
+
 function isApp(r: ResultDto): boolean {
   const ext = extOf(r.name);
-  return !r.is_dir && (ext === ".exe" || ext === ".lnk");
+  return !r.is_dir && (ext === ".exe" || ext === ".lnk" || isUwp(r));
+}
+
+/** 结果类型：file（默认）| command | audio */
+function kindOf(r: ResultDto): string {
+  return r.kind ?? "file";
+}
+
+/** 命令 / 音频设备这类"动作型"结果：回车不打开文件，而是执行。 */
+function isAction(r: ResultDto): boolean {
+  const k = kindOf(r);
+  return k === "command" || k === "audio";
+}
+
+/** 触发词之后的剩余文本，作为命令的 {arg}（与后端 match_command 的切分一致） */
+function pendingArg(): string {
+  const parts = q.value.trim().split(/\s+/);
+  return parts.length > 1 ? parts.slice(1).join(" ") : "";
 }
 
 function iconUrl(r: ResultDto): Promise<string> {
@@ -108,11 +155,29 @@ function esc(s: string): string {
     .replace(/>/g, "&gt;");
 }
 
-function highlight(name: string, start: number, len: number): string {
-  // match 索引是 UTF-16 单位 = JS 字符串下标，天然对齐
-  const s = Math.max(0, Math.min(start, name.length));
-  const e = Math.max(s, Math.min(s + len, name.length));
-  return `${esc(name.slice(0, s))}<mark>${esc(name.slice(s, e))}</mark>${esc(name.slice(e))}`;
+function highlight(name: string, spans: [number, number][]): string {
+  // 合并重叠区间后逐段加 <mark>（索引是 UTF-16 单位 = JS 字符串下标，天然对齐）
+  const ranges: [number, number][] = [];
+  for (const [a, b] of spans) {
+    const s = Math.max(0, Math.min(a, name.length));
+    const e = Math.max(s, Math.min(b, name.length));
+    if (e > s) ranges.push([s, e]);
+  }
+  if (ranges.length === 0) return esc(name);
+  ranges.sort((x, y) => x[0] - y[0]);
+  const merged: [number, number][] = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  }
+  let out = "";
+  let pos = 0;
+  for (const [s, e] of merged) {
+    out += esc(name.slice(pos, s)) + "<mark>" + esc(name.slice(s, e)) + "</mark>";
+    pos = e;
+  }
+  return out + esc(name.slice(pos));
 }
 
 function render(stagger: boolean) {
@@ -130,15 +195,31 @@ function render(stagger: boolean) {
     (isRecent ? `<div class="recent-title">最近使用</div>` : "") +
     items
       .map((r, i) => {
-        const badge = r.is_dir ? "文件夹" : extOf(r.name).slice(1).toUpperCase();
-        const nameHtml = r.match_len > 0 ? highlight(r.name, r.match_start, r.match_len) : esc(r.name);
-        return `<div class="row${i === sel ? " sel" : ""}" data-i="${i}" style="--i:${i}">
-        <img data-ext="${esc(extOf(r.name))}" data-dir="${r.is_dir ? 1 : 0}" alt=""/>
+        const uwp = isUwp(r);
+        const kind = kindOf(r);
+        const action = kind === "command" || kind === "audio";
+        const badge = action
+          ? kind === "audio"
+            ? "音频"
+            : "命令"
+          : r.is_dir
+            ? "文件夹"
+            : uwp
+              ? "应用"
+              : extOf(r.name).slice(1).toUpperCase();
+        const nameHtml =
+          r.spans && r.spans.length > 0 ? highlight(r.name, r.spans) : esc(r.name);
+        const sub = action && r.subtitle ? r.subtitle : uwp ? "系统应用" : r.path;
+        const ico = action
+          ? `<span class="ico">${kind === "audio" ? "🔊" : "⚡"}</span>`
+          : `<img data-ext="${esc(extOf(r.name))}" data-dir="${r.is_dir ? 1 : 0}" alt=""/>`;
+        return `<div class="row${i === sel ? " sel" : ""}${action ? " action" : ""}" data-i="${i}" style="--i:${i}">
+        ${ico}
         <div class="txt">
           <div class="name">${nameHtml}</div>
-          <div class="path">${esc(r.path)}</div>
+          <div class="path">${esc(sub)}</div>
         </div>
-        <span class="badge">${esc(badge)}</span>
+        <span class="badge${action ? " badge-cmd" : ""}">${esc(badge)}</span>
       </div>`;
       })
       .join("");
@@ -248,28 +329,42 @@ interface CtxEntry {
 }
 
 function buildCtxEntries(it: ResultDto): (CtxEntry | "sep")[] {
+  // 命令 / 音频设备：只有"执行"一种语义
+  if (isAction(it)) {
+    return [
+      { label: "执行", hint: "↵", run: () => { void activate(it); } },
+      "sep",
+      { label: "复制名称", run: () => copyFlash(it.name, false) },
+    ];
+  }
   const ext = extOf(it.name);
+  const uwp = isUwp(it);
   const isApp =
     !it.is_dir &&
     (ext === ".exe" || ext === ".lnk" || ext === ".bat" || ext === ".cmd" || ext === ".msi");
   const hide = () => invoke("hide_window");
   const entries: (CtxEntry | "sep")[] = [
     { label: "打开", hint: "↵", run: () => { hide(); invoke("open_path", { path: it.path }); } },
-    { label: "打开所在文件夹", hint: "Ctrl ↵", run: () => { hide(); invoke("reveal_path", { path: it.path }); } },
-    "sep",
-    { label: "复制路径", run: () => copyFlash(it.path, false) },
-    { label: "复制文件", run: () => copyFlash(it.path, true) },
+  ];
+  if (!uwp) {
+    entries.push({ label: "打开所在文件夹", hint: "Ctrl ↵", run: () => { hide(); invoke("reveal_path", { path: it.path }); } });
+  }
+  entries.push("sep", { label: "复制路径", run: () => copyFlash(it.path, false) });
+  if (!uwp) {
+    entries.push({ label: "复制文件", run: () => copyFlash(it.path, true) });
+  }
+  entries.push(
     "sep",
     { label: "在 cmd 中打开", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "cmd" }); } },
     { label: "在 PowerShell 中打开", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "powershell" }); } },
     { label: "在 cmd 中打开（管理员）", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "cmd_admin" }); } },
     { label: "在 PowerShell 中打开（管理员）", run: () => { hide(); invoke("open_in_terminal", { path: it.path, kind: "powershell_admin" }); } },
-  ];
+  );
   const extra: CtxEntry[] = [];
   if (isApp) {
     extra.push({ label: "以管理员身份运行", run: () => { hide(); invoke("run_as_admin", { path: it.path }); } });
   }
-  if (!it.is_dir) {
+  if (!it.is_dir && !uwp) {
     extra.push({ label: "打开方式…", run: () => { hide(); invoke("open_with_dialog", { path: it.path }); } });
   }
   if (extra.length > 0) entries.push("sep", ...extra);
@@ -291,6 +386,31 @@ function flashStatus(text: string) {
   statusEl.textContent = text;
   window.clearTimeout(flashTimer);
   flashTimer = window.setTimeout(() => refreshStatus(), 1800);
+}
+
+/**
+ * 执行一条结果。
+ * - 文件 / 文件夹 / UWP：ShellExecute 打开
+ * - 自定义命令、音频设备：交给后端 run_custom
+ *
+ * 命令失败时**不隐藏窗口**，让用户看到失败原因（例如取消了 UAC）。
+ */
+async function activate(it: ResultDto): Promise<void> {
+  if (!isAction(it)) {
+    invoke("hide_window");
+    invoke("open_path", { path: it.path });
+    return;
+  }
+  try {
+    const msg = await invoke<string>("run_custom", {
+      id: it.path,
+      arg: pendingArg(),
+    });
+    flashStatus(typeof msg === "string" && msg ? msg : "已执行");
+    invoke("hide_window");
+  } catch (e) {
+    flashStatus(String(e));
+  }
 }
 
 function showCtxMenu(x: number, y: number, it: ResultDto, idx: number) {
@@ -382,11 +502,19 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     const it = items[sel];
     if (!it) return;
-    invoke("hide_window"); // 先收起，再异步启动目标（目标启动慢也不残留）
-    if (e.ctrlKey) {
+    if (e.ctrlKey && !isAction(it)) {
+      invoke("hide_window"); // 先收起，再异步启动目标（目标启动慢也不残留）
       invoke("reveal_path", { path: it.path });
     } else {
-      invoke("open_path", { path: it.path });
+      void activate(it);
+    }
+  } else if (e.altKey && !settingsMode) {
+    // Alt+1~9：直接打开第 N 条结果
+    const m = /^(?:Digit|Numpad)([1-9])$/.exec(e.code);
+    const it = m ? items[Number(m[1]) - 1] : undefined;
+    if (it) {
+      e.preventDefault();
+      void activate(it);
     }
   }
 });
@@ -401,13 +529,18 @@ results.addEventListener("click", (e) => {
   if (!row) return;
   const it = items[Number(row.dataset.i)];
   if (!it) return;
-  invoke("hide_window");
-  invoke("open_path", { path: it.path });
+  void activate(it);
 });
 
 // —— 设置视图（与弹窗同 WebView）——
 let settingsMode = false;
 let themeSetting = "auto";
+
+// 自定义命令的编辑状态（设置页内嵌管理）
+let cmdList: CustomCommand[] = [];
+let cmdEditing: CustomCommand | null = null;
+let cmdJsonMode = false;
+let cmdJsonText = "";
 
 interface SettingsPayload {
   autostart_registered: boolean;
@@ -443,6 +576,15 @@ async function renderSettings() {
     return;
   }
   if (!settingsMode) return; // 期间已切回搜索
+  // 自定义命令列表（独立于 settings.json，便于导出分享）
+  try {
+    cmdList = await invoke<CustomCommand[]>("list_custom_commands");
+  } catch {
+    cmdList = [];
+  }
+  if (!Array.isArray(cmdList)) cmdList = [];
+  cmdEditing = null;
+  cmdJsonMode = false;
   results.classList.remove("stagger");
   results.innerHTML = `<div class="settings-view">
     <label class="opt"><input type="checkbox" id="s-autostart" ${p.autostart ? "checked" : ""}/> 开机自启</label>
@@ -477,6 +619,9 @@ async function renderSettings() {
     <div class="opt-title">排除目录</div>
     <div class="opt-hint">每行一个绝对路径，命中目录下的文件不出现在搜索结果。</div>
     <textarea id="s-excluded" rows="4" spellcheck="false">${esc(p.excluded_dirs.join("\n"))}</textarea>
+    <div class="opt-title">自定义命令</div>
+    <div class="opt-hint">加一条命令后，在搜索框里输入它的触发词就能直接执行。命令存在单独的 commands.json，可整份导出分享给别人。</div>
+    <div id="s-cmds" class="cmd-box"></div>
     <div class="settings-actions">
       <button id="s-save">保存</button>
       <span id="s-status"></span>
@@ -528,6 +673,9 @@ async function renderSettings() {
     applyTheme();
   });
 
+  // 自定义命令管理区
+  renderCommandSection();
+
   document.getElementById("s-save")!.addEventListener("click", async () => {
     const disabled = Array.from(
       results.querySelectorAll<HTMLInputElement>("#s-volumes input[data-letter]")
@@ -561,14 +709,239 @@ async function renderSettings() {
   });
 }
 
+// —— 自定义命令管理（设置页内嵌） ——
+
+function cmdKindLabel(kind: string): string {
+  const hit = CMD_KINDS.find((k) => k[0] === kind);
+  return hit ? hit[1] : kind;
+}
+
+function cmdSummary(c: CustomCommand): string {
+  const body =
+    c.kind === "exe" && c.args.length > 0 ? `${c.command} ${c.args.join(" ")}` : c.command;
+  const kw = c.keyword.trim() ? `触发词 ${c.keyword} · ` : "";
+  return `${kw}${cmdKindLabel(c.kind)}${body ? " · " + body : ""}`;
+}
+
+function setCmdStatus(text: string) {
+  const el = document.getElementById("cmd-status");
+  if (el) el.textContent = text;
+}
+
+async function persistCommands(): Promise<boolean> {
+  try {
+    await invoke("save_custom_commands", { commands: cmdList });
+    return true;
+  } catch (e) {
+    setCmdStatus(`保存失败: ${e}`);
+    return false;
+  }
+}
+
+function renderCommandSection() {
+  const box = document.getElementById("s-cmds");
+  if (!box) return;
+  const rows = cmdList
+    .map(
+      (c, i) => `<div class="cmd-row">
+      <input type="checkbox" data-cmd-enable="${i}" ${c.enabled ? "checked" : ""} title="启用/停用"/>
+      <div class="cmd-main">
+        <div class="cmd-name">${esc(c.name || "(未命名)")}</div>
+        <div class="cmd-sub">${esc(cmdSummary(c))}</div>
+      </div>
+      <button class="mini" data-cmd-edit="${i}">编辑</button>
+      <button class="mini" data-cmd-del="${i}">删除</button>
+    </div>`
+    )
+    .join("");
+  box.innerHTML = `
+    <div class="cmd-list">${
+      rows || `<div class="opt-hint">还没有自定义命令，点“新增命令”添加一条。</div>`
+    }</div>
+    <div class="opt-row">
+      <button class="mini" id="cmd-add">新增命令</button>
+      <button class="mini" id="cmd-json">导入 / 导出 JSON</button>
+      <span id="cmd-status" class="opt-hint"></span>
+    </div>
+    <div id="cmd-editor"></div>
+    <div id="cmd-json-box"></div>`;
+
+  box.querySelectorAll<HTMLInputElement>("input[data-cmd-enable]").forEach((el) => {
+    el.addEventListener("change", async () => {
+      const i = Number(el.dataset.cmdEnable);
+      if (!cmdList[i]) return;
+      cmdList[i].enabled = el.checked;
+      await persistCommands();
+    });
+  });
+  box.querySelectorAll<HTMLButtonElement>("button[data-cmd-edit]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const i = Number(el.dataset.cmdEdit);
+      const src = cmdList[i];
+      if (!src) return;
+      cmdEditing = { ...src, args: [...src.args] };
+      cmdJsonMode = false;
+      renderCommandSection();
+    });
+  });
+  box.querySelectorAll<HTMLButtonElement>("button[data-cmd-del]").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const i = Number(el.dataset.cmdDel);
+      const name = cmdList[i]?.name ?? "";
+      cmdList.splice(i, 1);
+      cmdEditing = null;
+      await persistCommands();
+      renderCommandSection();
+      setCmdStatus(`已删除 ${name}`);
+    });
+  });
+  document.getElementById("cmd-add")!.addEventListener("click", () => {
+    cmdEditing = {
+      id: "",
+      name: "",
+      keyword: "",
+      kind: "shell",
+      command: "",
+      args: [],
+      workdir: "",
+      admin: false,
+      hidden: true,
+      enabled: true,
+    };
+    cmdJsonMode = false;
+    renderCommandSection();
+  });
+  document.getElementById("cmd-json")!.addEventListener("click", () => {
+    cmdJsonMode = !cmdJsonMode;
+    if (cmdJsonMode) cmdJsonText = JSON.stringify(cmdList, null, 2);
+    cmdEditing = null;
+    renderCommandSection();
+  });
+
+  if (cmdEditing) renderCommandEditor();
+  if (cmdJsonMode) renderCommandJsonBox();
+}
+
+function renderCommandEditor() {
+  const box = document.getElementById("cmd-editor");
+  if (!box || !cmdEditing) return;
+  const c = cmdEditing;
+  const isNew = !cmdList.some((x) => x.id === c.id);
+  box.innerHTML = `
+    <div class="cmd-form">
+      <div class="opt-row">
+        <label class="opt sub">名称<input id="cf-name" value="${esc(c.name)}" placeholder="切换音频设备"/></label>
+        <label class="opt sub">触发词<input id="cf-kw" value="${esc(c.keyword)}" placeholder="空格分隔，如：音频 yp"/></label>
+      </div>
+      <div class="opt-row">
+        <label class="opt sub">类型<select id="cf-kind">${CMD_KINDS.map(
+          (k) => `<option value="${k[0]}" ${c.kind === k[0] ? "selected" : ""}>${esc(k[1])}</option>`
+        ).join("")}</select></label>
+        <label class="opt sub">工作目录<input id="cf-dir" value="${esc(c.workdir)}" placeholder="留空 = 默认"/></label>
+      </div>
+      <label class="opt sub">命令内容<input id="cf-cmd" value="${esc(c.command)}" placeholder="nircmd setdefaultsounddevice 耳机"/></label>
+      <label class="opt sub">参数<input id="cf-args" value="${esc(c.args.join(" "))}" placeholder="仅“运行程序”用；空格分隔，支持 {arg}"/></label>
+      <label class="opt sub"><input type="checkbox" id="cf-admin" ${c.admin ? "checked" : ""}/> 以管理员身份运行（会弹 UAC）</label>
+      <label class="opt sub"><input type="checkbox" id="cf-hidden" ${c.hidden ? "checked" : ""}/> 隐藏控制台黑框</label>
+      <div class="opt-hint">占位符 {arg} = 触发词之后剩下的文字。例：触发词 yt、类型“运行程序”、命令 mpv.exe、参数 {arg}，输入“yt 猫和老鼠”就会执行 mpv.exe 猫和老鼠。</div>
+      <div class="opt-row">
+        <button id="cf-save">${isNew ? "添加" : "保存修改"}</button>
+        <button class="mini" id="cf-cancel">取消</button>
+      </div>
+    </div>`;
+
+  document.getElementById("cf-save")!.addEventListener("click", async () => {
+    const val = (id: string) =>
+      (document.getElementById(id) as HTMLInputElement).value.trim();
+    const name = val("cf-name");
+    if (!name) {
+      setCmdStatus("请先填写名称");
+      return;
+    }
+    const updated: CustomCommand = {
+      id: c.id || `c${Date.now()}`,
+      name,
+      keyword: val("cf-kw"),
+      kind: (document.getElementById("cf-kind") as HTMLSelectElement).value,
+      command: val("cf-cmd"),
+      args: val("cf-args").split(/\s+/).filter(Boolean),
+      workdir: val("cf-dir"),
+      admin: (document.getElementById("cf-admin") as HTMLInputElement).checked,
+      hidden: (document.getElementById("cf-hidden") as HTMLInputElement).checked,
+      enabled: c.enabled,
+    };
+    const idx = cmdList.findIndex((x) => x.id === updated.id);
+    if (idx >= 0) cmdList[idx] = updated;
+    else cmdList.push(updated);
+    cmdEditing = null;
+    const ok = await persistCommands();
+    renderCommandSection();
+    if (ok) setCmdStatus("已保存，回搜索框输入触发词即可用");
+  });
+  document.getElementById("cf-cancel")!.addEventListener("click", () => {
+    cmdEditing = null;
+    renderCommandSection();
+  });
+}
+
+function renderCommandJsonBox() {
+  const box = document.getElementById("cmd-json-box");
+  if (!box || !cmdJsonMode) return;
+  box.innerHTML = `
+    <div class="opt-hint">把这段 JSON 复制给别人，对方粘贴后点“导入覆盖”就能得到完全一样的命令集。</div>
+    <textarea id="cmd-json" rows="8" spellcheck="false">${esc(cmdJsonText)}</textarea>
+    <div class="opt-row">
+      <button class="mini" id="cmd-json-current">填入当前配置</button>
+      <button class="mini" id="cmd-json-import">导入覆盖</button>
+      <button class="mini" id="cmd-json-copy">复制到剪贴板</button>
+    </div>`;
+  const ta = document.getElementById("cmd-json") as HTMLTextAreaElement;
+  ta.addEventListener("input", () => {
+    cmdJsonText = ta.value;
+  });
+  document.getElementById("cmd-json-current")!.addEventListener("click", () => {
+    cmdJsonText = JSON.stringify(cmdList, null, 2);
+    renderCommandJsonBox();
+  });
+  document.getElementById("cmd-json-copy")!.addEventListener("click", async () => {
+    try {
+      await invoke("copy_path", { path: cmdJsonText });
+      setCmdStatus("JSON 已复制到剪贴板");
+    } catch (e) {
+      setCmdStatus(`复制失败: ${e}`);
+    }
+  });
+  document.getElementById("cmd-json-import")!.addEventListener("click", async () => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(cmdJsonText);
+    } catch {
+      setCmdStatus("JSON 格式错误，检查一下括号和逗号");
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      setCmdStatus("JSON 顶层必须是一个数组");
+      return;
+    }
+    cmdList = (parsed as CustomCommand[]).map((c) => ({
+      ...c,
+      args: Array.isArray(c?.args) ? c.args : [],
+    }));
+    const n = cmdList.length;
+    const ok = await persistCommands();
+    renderCommandSection();
+    if (ok) setCmdStatus(`已导入 ${n} 条命令`);
+  });
+}
+
 let hotkeyErrorBound = false;
 function listenHotkeyError() {
   if (hotkeyErrorBound) return;
   hotkeyErrorBound = true;
-  listen("hotkey-error", ((ev: { payload: string }) => {
+  listen<string>("hotkey-error", (ev) => {
     const el = document.getElementById("s-status");
     if (el) el.textContent = ev.payload;
-  }) as unknown as EventListener);
+  });
 }
 
 function exitSettings() {
@@ -605,6 +978,13 @@ await listen("popup-hiding", () => {
   closeCtxMenu();
   panel.classList.remove("visible");
 });
+// Alt+1~9 数字直达（钩子层拦截后转发；WebView2 输入链路对 Alt+数字 不可靠）
+await listen<number>("quick-open", (ev) => {
+  if (settingsMode) return;
+  const it = items[ev.payload - 1];
+  if (!it) return;
+  void activate(it);
+});
 // 窗口获得焦点时若处于搜索态，确保光标在搜索框
 window.addEventListener("focus", () => {
   if (!settingsMode && document.activeElement !== q) {
@@ -612,10 +992,18 @@ window.addEventListener("focus", () => {
   }
 });
 
-listen("index-ready", ((ev: { payload: { entries: number; startupMs: number; isAdmin: boolean; usnLive: string[]; fromSnapshot: boolean } }) => {
+interface IndexReadyPayload {
+  entries: number;
+  startupMs: number;
+  isAdmin: boolean;
+  usnLive: string[];
+  fromSnapshot: boolean;
+}
+
+listen<IndexReadyPayload>("index-ready", (ev) => {
   const p = ev.payload;
   statusEl.textContent = statusText(p.entries, p.usnLive);
-}) as unknown as EventListener);
+});
 
 function statusText(entries: number, usnLive: string[]): string {
   const mode = usnLive && usnLive.length > 0 ? "MFT 实时" : "遍历快照";

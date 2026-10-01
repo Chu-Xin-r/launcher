@@ -117,6 +117,21 @@ fn mods_now() -> u32 {
     m
 }
 
+/// Alt+1~9 直达的防重复时间戳
+static QUICK_OPEN_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// 主键盘 1~9 / 数字小键盘 1~9 → 序号（1 起）
+#[inline]
+fn quick_open_index(vk: u32) -> Option<usize> {
+    if (0x31..=0x39).contains(&vk) {
+        Some((vk - 0x30) as usize)
+    } else if (0x61..=0x69).contains(&vk) {
+        Some((vk - 0x60) as usize)
+    } else {
+        None
+    }
+}
+
 /// 呼出后的短暂焦点保护期，避免 show/focus 的瞬时失焦事件误隐藏。
 pub fn popup_focus_guard_active() -> bool {
     now_ms() < POPUP_FOCUS_GUARD_UNTIL_MS.load(Ordering::Acquire)
@@ -208,6 +223,23 @@ extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         }
                     }
                     return LRESULT(1); // 吞掉：不传给系统/应用
+                }
+            }
+
+            // 弹窗可见时：Alt+1~9 直接打开第 N 条结果。
+            // 在钩子层吞键并转发事件（WebView2 输入链路对 Alt+数字 不可靠）。
+            if is_down && POPUP_VISIBLE.load(Ordering::Acquire) {
+                if let Some(n) = quick_open_index(info.vkCode) {
+                    if mods_now() & 2 != 0 {
+                        let now = now_ms();
+                        if now.saturating_sub(QUICK_OPEN_LAST.load(Ordering::Relaxed)) > 300 {
+                            QUICK_OPEN_LAST.store(now, Ordering::Relaxed);
+                            if let Some(app) = APP.get() {
+                                let _ = app.emit("quick-open", n);
+                            }
+                        }
+                        return LRESULT(1); // 吞掉：不进入输入链路
+                    }
                 }
             }
 

@@ -21,12 +21,17 @@ use windows::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    ShellExecuteExW, ShellExecuteW, SHOpenWithDialog, OAIF_ALLOW_REGISTRATION, OAIF_EXEC,
-    OPENASINFO, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW,
+    IEnumShellItems, IShellItem, SHGetFileInfoW, SHGetIDListFromObject, SHGetKnownFolderItem,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL, BHID_EnumItems, FOLDERID_AppsFolder,
+    KF_FLAG_DEFAULT, OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SEE_MASK_INVOKEIDLIST,
+    SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW, SHOpenWithDialog,
+    SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetShellWindow, GetWindowThreadProcessId, SW_SHOW, SW_SHOWNORMAL,
+    DestroyIcon, GetShellWindow, GetWindowThreadProcessId, SW_SHOW, SW_SHOWNORMAL,
 };
 
 fn to_pcw(s: &str) -> Vec<u16> {
@@ -371,4 +376,91 @@ pub fn open_with_dialog(path: String) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// —— UWP / 系统应用（shell:AppsFolder）：无磁盘文件的商店应用 ——
+
+/// 枚举到的 UWP / 系统应用条目。
+pub struct UwpAppInfo {
+    pub name: String,
+    pub aumid: String,
+    pub icon: Option<(i32, i32, Vec<u8>)>,
+}
+
+/// 枚举 shell:AppsFolder 中的 UWP / 系统应用（设置、计算器、照片、商店等）。
+/// 过滤磁盘文件路径项（文件索引已覆盖）与 shell 命名空间项（::{...}）。
+pub fn enumerate_uwp_apps() -> Vec<UwpAppInfo> {
+    let mut out: Vec<UwpAppInfo> = Vec::new();
+    unsafe {
+        crate::commands::init_com();
+        let folder: IShellItem =
+            match SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None) {
+                Ok(f) => f,
+                Err(_) => return out,
+            };
+        let en: IEnumShellItems = match folder.BindToHandler(None, &BHID_EnumItems) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+        loop {
+            let mut batch: [Option<IShellItem>; 1] = [None];
+            if en.Next(&mut batch, None).is_err() || batch[0].is_none() {
+                break;
+            }
+            let Some(item) = batch[0].take() else { break };
+
+            let Ok(name_pw) = item.GetDisplayName(SIGDN_NORMALDISPLAY) else {
+                continue;
+            };
+            let name = name_pw.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(name_pw.0 as *const c_void));
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+
+            let Ok(parse_pw) = item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) else {
+                continue;
+            };
+            let parse = parse_pw.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(parse_pw.0 as *const c_void));
+            // 跳过磁盘路径（文件索引已覆盖）与 shell 命名空间项
+            if parse.contains(":\\") || parse.starts_with("::") {
+                continue;
+            }
+            let aumid = parse
+                .strip_prefix("shell:AppsFolder\\")
+                .unwrap_or(&parse)
+                .to_string();
+            if aumid.is_empty() {
+                continue;
+            }
+            let icon = shell_item_icon(&item);
+            out.push(UwpAppInfo { name, aumid, icon });
+        }
+    }
+    out
+}
+
+/// 用 Shell 项自身提取大图标（PIDL + SHGetFileInfoW，复用 HICON → RGBA 管线）。
+fn shell_item_icon(item: &IShellItem) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let pidl = SHGetIDListFromObject(item).ok()?;
+        let mut info = SHFILEINFOW::default();
+        let r = SHGetFileInfoW(
+            PCWSTR(pidl as *const u16),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL,
+        );
+        CoTaskMemFree(Some(pidl as *const c_void));
+        if r == 0 || info.hIcon.is_invalid() {
+            return None;
+        }
+        let icon = info.hIcon;
+        let out = crate::commands::icon_to_rgba(icon).map(|c| (c.w, c.h, c.rgba));
+        let _ = DestroyIcon(icon);
+        out
+    }
 }

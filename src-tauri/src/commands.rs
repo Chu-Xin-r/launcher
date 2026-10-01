@@ -23,6 +23,8 @@ pub struct AppState {
     pub usage: Arc<Mutex<HashMap<String, UseStat>>>,
     /// 归一化后的排除目录前缀（搜索结果兜底过滤）
     pub excluded: Arc<Mutex<Vec<String>>>,
+    /// UWP 应用图标（shell:AppsFolder → RGBA），独立缓存避免被普通缓存清空
+    pub uwp_icons: Arc<Mutex<HashMap<String, CachedIcon>>>,
     /// 托盘“显示启动器”菜单项（设置变更时刷新文案）
     pub tray_show_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
     /// 托盘图标（设置变更时刷新 tooltip）
@@ -43,6 +45,12 @@ pub struct ResultDto {
     pub score: i32,
     pub match_start: u16,
     pub match_len: u16,
+    /// 全部命中词的区间（多词高亮）
+    pub spans: Vec<(u16, u16)>,
+    /// "file"（磁盘文件/文件夹/UWP）| "command"（自定义命令）| "audio"（音频设备）
+    pub kind: String,
+    /// 副标题：命令显示类型与命令内容，音频显示"回车设为默认设备"
+    pub subtitle: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -160,6 +168,9 @@ pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Res
                 score: r.score,
                 match_start: r.match_start,
                 match_len: r.match_len,
+                spans: r.spans,
+                kind: "file".into(),
+                subtitle: String::new(),
             })
             .collect();
         // 排除目录兜底过滤（索引增量阶段新文件也会被挡住）
@@ -169,11 +180,95 @@ pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Res
                 items.retain(|r| !crate::settings::is_excluded(&r.path, &ex));
             }
         }
+        // 自定义命令与内置动作（音频设备）混入同一份结果
+        append_commands(&query, &mut items);
+        // 统一按分数重排：apply_usage_boost 在没有使用记录时会提前返回、
+        // 不做排序，命令就会留在文件结果之后被下面的截断丢掉。
+        items.sort_unstable_by(|a, b| b.score.cmp(&a.score));
         apply_usage_boost(&usage.lock().unwrap(), &mut items);
+        // 裁掉尾部多余的
+        items.truncate(50);
         items
     })
     .await
     .map_err(|e| format!("搜索失败: {e}"))
+}
+
+/// 把命中的自定义命令追加到结果里。
+///
+/// `builtin` 的音频动作不是"一条命令"，而是把当前机器上的设备**运行时枚举**
+/// 成多条结果 —— 这样换一台电脑、换一副耳机都自动适配，不需要改配置。
+fn append_commands(query: &str, items: &mut Vec<ResultDto>) {
+    for c in crate::custom_cmd::load_commands() {
+        if !c.enabled {
+            continue;
+        }
+        let score = match crate::custom_cmd::match_command(&c, query) {
+            Some(s) => s,
+            None => continue,
+        };
+        if c.kind == "builtin" && (c.command == "audio.switch" || c.command == "audio.capture") {
+            let capture = c.command == "audio.capture";
+            if let Ok(devices) = crate::audio::list_devices(capture) {
+                for d in devices {
+                    items.push(ResultDto {
+                        name: d.name,
+                        path: format!("aud:{}", d.id),
+                        is_dir: false,
+                        score: score + (if d.is_default { -50 } else { 0 }),
+                        match_start: 0,
+                        match_len: 0,
+                        spans: Vec::new(),
+                        kind: "audio".into(),
+                        subtitle: if d.is_default {
+                            "当前默认设备".to_string()
+                        } else if capture {
+                            "回车设为默认录音设备".to_string()
+                        } else {
+                            "回车设为默认播放设备".to_string()
+                        },
+                    });
+                }
+            }
+            continue;
+        }
+        items.push(ResultDto {
+            name: c.name.clone(),
+            path: format!("cmd:{}", c.id),
+            is_dir: false,
+            score,
+            match_start: 0,
+            match_len: 0,
+            spans: Vec::new(),
+            kind: "command".into(),
+            subtitle: describe_command(&c),
+        });
+    }
+}
+
+/// 命令行的副标题文案："cmd · nircmd setdefaultsounddevice 耳机"。
+fn describe_command(c: &crate::custom_cmd::CustomCommand) -> String {
+    let head = match c.kind.as_str() {
+        "powershell" => "PowerShell",
+        "exe" => "运行程序",
+        "url" => "打开网址",
+        "builtin" => "内置动作",
+        _ => "cmd",
+    };
+    let body = if c.kind == "exe" && !c.args.is_empty() {
+        format!("{} {}", c.command, c.args.join(" "))
+    } else {
+        c.command.clone()
+    };
+    let body: String = body.trim().chars().take(70).collect();
+    let body = body.trim();
+    if body.is_empty() {
+        head.to_string()
+    } else if c.admin {
+        format!("{head}（管理员）· {body}")
+    } else {
+        format!("{head} · {body}")
+    }
 }
 
 /// 最近使用（空白态展示）：按最近打开时间倒序（旧数据按次数兜底），
@@ -184,6 +279,7 @@ pub async fn recent_items(
     state: State<'_, AppState>,
 ) -> Result<Vec<ResultDto>, String> {
     let usage = Arc::clone(&state.usage);
+    let engine = Arc::clone(&state.engine);
     tauri::async_runtime::spawn_blocking(move || {
         let u = usage.lock().unwrap();
         let mut list: Vec<(&String, &UseStat)> = u.iter().collect();
@@ -192,6 +288,40 @@ pub async fn recent_items(
         for (path, _) in list {
             if out.len() >= limit {
                 break;
+            }
+            // 自定义命令：无磁盘文件，按 ID 还原显示名
+            if let Some(cid) = path.strip_prefix("cmd:") {
+                if let Some(c) = crate::custom_cmd::find(cid) {
+                    out.push(ResultDto {
+                        name: c.name.clone(),
+                        path: path.clone(),
+                        is_dir: false,
+                        score: 0,
+                        match_start: 0,
+                        match_len: 0,
+                        spans: Vec::new(),
+                        kind: "command".into(),
+                        subtitle: describe_command(&c),
+                    });
+                }
+                continue;
+            }
+            // UWP / 系统应用：无磁盘文件，按 AUMID 还原显示名
+            if let Some(aumid) = path.strip_prefix("shell:AppsFolder\\") {
+                if let Some(name) = engine.uwp_app_name(aumid) {
+                    out.push(ResultDto {
+                        name,
+                        path: path.clone(),
+                        is_dir: false,
+                        score: 0,
+                        match_start: 0,
+                        match_len: 0,
+                        spans: Vec::new(),
+                        kind: "file".into(),
+                        subtitle: String::new(),
+                    });
+                }
+                continue;
             }
             let p = std::path::Path::new(path.as_str());
             if !p.exists() {
@@ -208,6 +338,9 @@ pub async fn recent_items(
                 score: 0,
                 match_start: 0,
                 match_len: 0,
+                spans: Vec::new(),
+                kind: "file".into(),
+                subtitle: String::new(),
             });
         }
         Ok(out)
@@ -358,6 +491,50 @@ pub fn get_hotkey_label() -> String {
     hotkey_label(&s.hotkey_mode, &s.custom_hotkey)
 }
 
+// —— 自定义命令 ——
+
+/// 读取全部自定义命令（设置页展示）。
+#[tauri::command]
+pub fn list_custom_commands() -> Vec<crate::custom_cmd::CustomCommand> {
+    crate::custom_cmd::load_commands()
+}
+
+/// 整体保存命令表（前端负责增删改，一次提交全量列表）。
+#[tauri::command]
+pub fn save_custom_commands(commands: Vec<crate::custom_cmd::CustomCommand>) -> Result<(), String> {
+    crate::custom_cmd::save_commands(&commands)
+}
+
+/// 执行一条命令类结果。`id` 取自搜索结果里的 `path`：
+/// - `cmd:<命令ID>`  自定义命令
+/// - `aud:<端点ID>`  切换默认音频设备
+#[tauri::command]
+pub fn run_custom(id: String, arg: String, state: State<'_, AppState>) -> Result<String, String> {
+    if let Some(dev) = id.strip_prefix("aud:") {
+        let name = crate::audio::list_devices(false)
+            .ok()
+            .and_then(|ds| ds.into_iter().find(|d| d.id == dev).map(|d| d.name))
+            .unwrap_or_else(|| "音频设备".to_string());
+        crate::audio::set_default_device(dev, true)?;
+        record_use(&state, &id);
+        return Ok(format!("已切换到 {name}"));
+    }
+    if let Some(cid) = id.strip_prefix("cmd:") {
+        let c = crate::custom_cmd::find(cid)
+            .ok_or_else(|| "命令不存在（可能已被删除）".to_string())?;
+        let msg = crate::custom_cmd::run(&c, &arg)?;
+        record_use(&state, &id);
+        return Ok(msg);
+    }
+    Err(format!("无法识别的命令: {id}"))
+}
+
+/// 自定义命令配置文件的绝对路径（设置页显示"可手动编辑/分享"用）。
+#[tauri::command]
+pub fn commands_file_path() -> String {
+    crate::custom_cmd::commands_file().to_string_lossy().into_owned()
+}
+
 #[derive(Serialize)]
 pub struct VolumeDto {
     pub letter: char,
@@ -494,6 +671,11 @@ pub fn get_windows_theme() -> String {
 /// 按扩展名取文件图标（RGBA）。`key`：扩展名（含点，如 ".pdf"）或 "dir"。
 /// `path` 非空且为 .exe/.lnk 时提取该文件的真实应用图标，缓存按完整路径。
 /// 异步 + 阻塞线程池：SHGetFileInfo 冷启动实测可达 180ms，绝不能占着 UI 主线程。
+/// 应用图标缓存键（get_icon 与 UWP 图标预填共用）。
+pub fn app_icon_cache_key(path: &str) -> String {
+    format!("p:{}", path.to_ascii_lowercase())
+}
+
 #[tauri::command]
 pub async fn get_icon(
     key: String,
@@ -501,14 +683,38 @@ pub async fn get_icon(
     state: State<'_, AppState>,
 ) -> Result<IconDto, String> {
     let cache = Arc::clone(&state.icon_cache);
+    let uwp_icons = Arc::clone(&state.uwp_icons);
     tauri::async_runtime::spawn_blocking(move || {
         let lower = path.to_ascii_lowercase();
+        // UWP / 系统应用：图标来自启动时枚举提取的专属缓存
+        if lower.starts_with("shell:appsfolder\\") {
+            if let Some(c) = uwp_icons.lock().unwrap().get(&app_icon_cache_key(&path)) {
+                return Ok(IconDto {
+                    w: c.w,
+                    h: c.h,
+                    rgba: c.rgba.clone(),
+                });
+            }
+            let fallback = extract_icon(&key).map(|c| IconDto {
+                w: c.w,
+                h: c.h,
+                rgba: c.rgba,
+            });
+            return match fallback {
+                Some(dto) => Ok(dto),
+                None => Err("无图标".into()),
+            };
+        }
         let is_app = lower.ends_with(".exe") || lower.ends_with(".lnk");
         let mut cache = cache.lock().unwrap();
         if cache.len() > 2048 {
             cache.clear(); // 真实路径缓存防膨胀
         }
-        let cache_key = if is_app { format!("p:{lower}") } else { key.clone() };
+        let cache_key = if is_app {
+            app_icon_cache_key(&path)
+        } else {
+            key.clone()
+        };
         let cached = cache.entry(cache_key).or_insert_with(|| {
             if is_app {
                 extract_icon_from_path(&path).or_else(|| extract_icon(&key))
@@ -530,7 +736,7 @@ pub async fn get_icon(
 }
 
 /// 初始化本线程 COM（Shell 图标提取依赖），已初始化则忽略。
-fn init_com() {
+pub(crate) fn init_com() {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -587,7 +793,7 @@ fn extract_icon(key: &str) -> Option<CachedIcon> {
 }
 
 /// HICON → 32 位 RGBA（GetIconInfo + GetDIBits）
-fn icon_to_rgba(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<CachedIcon> {
+pub(crate) fn icon_to_rgba(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<CachedIcon> {
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetDC, GetObjectW, ReleaseDC,
         BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,

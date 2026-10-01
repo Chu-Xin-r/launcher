@@ -8,3 +8,7 @@ target/
 # 本地杂项
 rust_out.exe
 msvc-cargo.cmd
+
+# 安装包（作为 Release 附件分发，不提交进仓库）
+*-setup.exe
+*.msi
