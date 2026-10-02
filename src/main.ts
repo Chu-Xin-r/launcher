@@ -845,7 +845,7 @@ function renderCommandEditor() {
       <label class="opt sub"><input type="checkbox" id="cf-hidden" ${c.hidden ? "checked" : ""}/> 隐藏控制台黑框</label>
       <div class="opt-hint">占位符 {arg} = 触发词之后剩下的文字。例：触发词 yt、类型“运行程序”、命令 mpv.exe、参数 {arg}，输入“yt 猫和老鼠”就会执行 mpv.exe 猫和老鼠。</div>
       <div class="opt-row">
-        <button id="cf-save">${isNew ? "添加" : "保存修改"}</button>
+        <button class="primary" id="cf-save">${isNew ? "添加" : "保存修改"}</button>
         <button class="mini" id="cf-cancel">取消</button>
       </div>
     </div>`;

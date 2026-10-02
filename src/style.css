@@ -520,6 +520,21 @@ body {
   padding-left: 0;
   gap: 8px;
 }
+/* 命令编辑器的主按钮（添加 / 保存修改）：与设置页底部“保存”同款 */
+.settings-view .primary {
+  flex: none;
+  background: #3b82f6;
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 6px 20px;
+  cursor: pointer;
+}
+.settings-view .primary:hover {
+  background: #2f6fe0;
+}
 .cmd-form .opt input:not([type="checkbox"]) {
   flex: 1;
   width: auto;

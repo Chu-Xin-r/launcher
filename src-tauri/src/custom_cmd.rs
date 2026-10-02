@@ -337,11 +337,12 @@ fn spawn_detached(exe: &str, rest: &str, spec: &CustomCommand) -> Result<(), Str
         } else {
             PCWSTR(dir_w.as_ptr())
         };
-    let flags = if spec.hidden {
+    // 括号不能省：否则 | 与 if 表达式的结合方式容易被误读
+    let flags = (if spec.hidden {
         CREATE_NO_WINDOW
     } else {
         CREATE_NEW_CONSOLE
-    } | CREATE_UNICODE_ENVIRONMENT;
+    }) | CREATE_UNICODE_ENVIRONMENT;
 
     unsafe {
         let mut si: STARTUPINFOW = std::mem::zeroed();
@@ -446,3 +447,4 @@ fn run_builtin(c: &CustomCommand, arg: &str) -> Result<String, String> {
         other => Err(format!("未知的内置动作: {other}（可能是新版本新增的）")),
     }
 }
+

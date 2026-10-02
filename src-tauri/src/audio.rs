@@ -9,9 +9,9 @@
 //! 都自动适配用户实际的声卡与蓝牙耳机名称。
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::core::{GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -39,8 +39,52 @@ const PKEY_DEVICE_FRIENDLYNAME: PROPERTYKEY = PROPERTYKEY {
     pid: 14,
 };
 
-/// 最近一次被设为默认的设备 ID：用于"来回切"。
-static LAST_DEFAULT: Mutex<Option<String>> = Mutex::new(None);
+/// "来回切"的历史状态。
+///
+/// 记录**上一次被切换离开**的默认设备 ID，必须落盘：只放内存的话重启即丢，
+/// 之后第一次 `qb` 只能退化成"按枚举顺序切下一个"，与用户预期不符。
+#[derive(Serialize, Deserialize, Default)]
+struct AudioState {
+    #[serde(default)]
+    last: Option<String>,
+}
+
+fn audio_state_file() -> PathBuf {
+    std::env::var("LOCALAPPDATA")
+        .map(|p| PathBuf::from(p).join("launcher").join("audio.json"))
+        .unwrap_or_else(|_| PathBuf::from("audio.json"))
+}
+
+fn load_last() -> Option<String> {
+    let s = std::fs::read_to_string(audio_state_file()).ok()?;
+    let st: AudioState = serde_json::from_str(&s).ok()?;
+    st.last.filter(|v| !v.trim().is_empty())
+}
+
+fn save_last(id: &str) {
+    let path = audio_state_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let st = AudioState {
+        last: Some(id.to_string()),
+    };
+    if let Ok(s) = serde_json::to_string_pretty(&st) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// 记住"切换前"的默认设备，供来回切使用（在真正切换之前调用）。
+///
+/// 放在 set_default_device 内部，这样无论用户是从搜索列表点选设备、
+/// 还是用 `qb` 来回切，历史都会被更新，来回切始终能切回上一个设备。
+fn remember_previous(next_id: &str) {
+    if let Ok(devices) = list_devices(false) {
+        if let Some(cur) = devices.iter().find(|d| d.is_default && d.id != next_id) {
+            save_last(&cur.id);
+        }
+    }
+}
 
 /// IUnknown 三个方法（所有 COM 接口 vtable 的前缀）。
 #[repr(C)]
@@ -160,6 +204,8 @@ pub fn set_default_device(device_id: &str, all_roles: bool) -> Result<(), String
     if device_id.trim().is_empty() {
         return Err("设备 ID 为空".into());
     }
+    // 先记下当前设备，供"来回切"用（落盘，重启后仍然有效）
+    remember_previous(device_id);
     crate::commands::init_com();
     let id_w = to_pcw(device_id);
     unsafe {
@@ -234,7 +280,7 @@ pub fn toggle_default() -> Result<String, String> {
 
     // 优先切回上一次的默认设备（历史仍有效且不等于当前设备时）
     let target = {
-        let last = LAST_DEFAULT.lock().unwrap().clone();
+        let last = load_last();
         match (&current, last) {
             (Some(cur), Some(last_id))
                 if last_id != cur.id && devices.iter().any(|d| d.id == last_id) =>
@@ -265,7 +311,8 @@ pub fn toggle_default() -> Result<String, String> {
         }
     };
 
+    // set_default_device 内部会把"切换前"的设备记进历史，无需在这里再写
     set_default_device(&target_id, true)?;
-    *LAST_DEFAULT.lock().unwrap() = current.map(|c| c.id);
     Ok(name_of(&target_id))
 }
+
