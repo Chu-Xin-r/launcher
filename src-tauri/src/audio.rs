@@ -41,11 +41,18 @@ const PKEY_DEVICE_FRIENDLYNAME: PROPERTYKEY = PROPERTYKEY {
 
 /// "来回切"的历史状态。
 ///
-/// 记录**上一次被切换离开**的默认设备 ID，必须落盘：只放内存的话重启即丢，
-/// 之后第一次 `qb` 只能退化成"按枚举顺序切下一个"，与用户预期不符。
+/// 记录**最近被切换离开**过的设备 ID（最新在前），落盘保存。
+///
+/// 用列表而不是单个值：单值一旦与实际不符（比如那次切换其实失败了，
+/// 或者用户从系统托盘手动改了默认设备），判定条件就不成立，只能退化成
+/// "按枚举顺序切下一个"，用户会感觉 qb 切到了莫名其妙的设备。
 #[derive(Serialize, Deserialize, Default)]
 struct AudioState {
+    /// 最近被切换离开的设备（最新在前）
     #[serde(default)]
+    recent: Vec<String>,
+    /// 0.2.1 的旧单值格式，只读用于迁移，不再写回
+    #[serde(default, skip_serializing)]
     last: Option<String>,
 }
 
@@ -55,35 +62,61 @@ fn audio_state_file() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("audio.json"))
 }
 
-fn load_last() -> Option<String> {
-    let s = std::fs::read_to_string(audio_state_file()).ok()?;
-    let st: AudioState = serde_json::from_str(&s).ok()?;
-    st.last.filter(|v| !v.trim().is_empty())
+fn load_state() -> AudioState {
+    std::fs::read_to_string(audio_state_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
-fn save_last(id: &str) {
+fn save_state(st: &AudioState) {
     let path = audio_state_file();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let st = AudioState {
-        last: Some(id.to_string()),
-    };
-    if let Ok(s) = serde_json::to_string_pretty(&st) {
+    if let Ok(s) = serde_json::to_string_pretty(st) {
         let _ = std::fs::write(path, s);
     }
 }
 
-/// 记住"切换前"的默认设备，供来回切使用（在真正切换之前调用）。
-///
-/// 放在 set_default_device 内部，这样无论用户是从搜索列表点选设备、
-/// 还是用 `qb` 来回切，历史都会被更新，来回切始终能切回上一个设备。
-fn remember_previous(next_id: &str) {
-    if let Ok(devices) = list_devices(false) {
-        if let Some(cur) = devices.iter().find(|d| d.is_default && d.id != next_id) {
-            save_last(&cur.id);
+/// 读取历史（兼容 0.2.1 的单值格式：`last` 当作 `recent[0]`）。
+fn load_recent() -> Vec<String> {
+    let st = load_state();
+    let mut v: Vec<String> = st
+        .recent
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if v.is_empty() {
+        if let Some(old) = st.last.filter(|s| !s.trim().is_empty()) {
+            v.push(old);
         }
     }
+    v
+}
+
+/// 记录"被切换离开"的设备。
+///
+/// **只在切换成功后调用**：切换失败还写历史的话，`recent` 会指向一个
+/// 从未真正生效的设备，把后续的来回切带偏。
+fn push_recent(id: &str) {
+    if id.trim().is_empty() {
+        return;
+    }
+    let mut st = load_state();
+    st.recent.retain(|x| x != id);
+    st.recent.insert(0, id.to_string());
+    st.recent.truncate(6);
+    save_state(&st);
+}
+
+/// 当前 Console 角色的默认设备 ID（`exclude` 用于排除某个 ID）。
+fn current_default_id(exclude: Option<&str>) -> Option<String> {
+    let devices = list_devices(false).ok()?;
+    devices
+        .iter()
+        .find(|d| d.is_default && exclude.map_or(true, |e| d.id != e))
+        .map(|d| d.id.clone())
 }
 
 /// IUnknown 三个方法（所有 COM 接口 vtable 的前缀）。
@@ -204,8 +237,8 @@ pub fn set_default_device(device_id: &str, all_roles: bool) -> Result<(), String
     if device_id.trim().is_empty() {
         return Err("设备 ID 为空".into());
     }
-    // 先记下当前设备，供"来回切"用（落盘，重启后仍然有效）
-    remember_previous(device_id);
+    // 记下切换前的设备，但**先不落盘**：切换失败时不能污染历史
+    let prev = current_default_id(Some(device_id));
     crate::commands::init_com();
     let id_w = to_pcw(device_id);
     unsafe {
@@ -240,7 +273,13 @@ pub fn set_default_device(device_id: &str, all_roles: bool) -> Result<(), String
         ((*vtbl).unk.release)(pc);
         match last_err {
             Some(e) => Err(format!("切换默认音频设备失败: {e}")),
-            None => Ok(()),
+            None => {
+                // 只有真正切成功了才记历史
+                if let Some(p) = prev {
+                    push_recent(&p);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -278,17 +317,14 @@ pub fn toggle_default() -> Result<String, String> {
             .unwrap_or_else(|| id.to_string())
     };
 
-    // 优先切回上一次的默认设备（历史仍有效且不等于当前设备时）
+    // 优先切回"最近被切换离开过、且仍然存在"的设备（列表最新在前）。
+    // 用列表而非单值：即便某个历史项已失效（设备拔了/那次切换失败），
+    // 也能顺延到下一个可用的，而不是直接掉进环形分支。
     let target = {
-        let last = load_last();
-        match (&current, last) {
-            (Some(cur), Some(last_id))
-                if last_id != cur.id && devices.iter().any(|d| d.id == last_id) =>
-            {
-                Some(last_id)
-            }
-            _ => None,
-        }
+        let cur_id = current.as_ref().map(|c| c.id.as_str());
+        load_recent()
+            .into_iter()
+            .find(|id| Some(id.as_str()) != cur_id && devices.iter().any(|d| &d.id == id))
     };
 
     let target_id = match target {
